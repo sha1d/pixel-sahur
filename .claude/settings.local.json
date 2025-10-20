@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(aftman install)",
+      "Bash(wally --version)",
+      "Bash(wally install)",
+      "Bash(tree src -I Packages)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
