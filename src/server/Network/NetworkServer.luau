@@ -37,7 +37,7 @@ function NetworkServer.new()
 
     -- Network settings
     self.tickRate = 20 -- 20Hz server tick rate
-    self.sendRate = 10 -- 10Hz update rate to clients
+    self.sendRate = 20 -- 20Hz update rate to clients (increased for better sync)
     self.maxPlayerTimeout = 30 -- Disconnect after 30 seconds of inactivity
 
     -- State
@@ -159,19 +159,35 @@ function NetworkServer:removePlayer(player: Player)
 end
 
 function NetworkServer:setupPacketHandlers()
-    -- Player input
+    -- Player input/position update (client-authoritative)
     Packets.PlayerInput.onServerEvent = function(data, player)
         local playerData = self.players[player]
         if not playerData then
             return
         end
 
-        playerData.lastInput = data.input
-        playerData.lastSequence = data.sequence
         playerData.lastActivity = tick()
 
-        if self.onPlayerInput then
-            self.onPlayerInput(player, data.input, data.deltaTime)
+        -- If this is a position update (client-authoritative model)
+        if data.position then
+            -- Client sends authoritative position/velocity
+            -- Server just validates and broadcasts to other players
+            playerData.position = data.position
+            playerData.velocity = data.velocity or {x = 0, y = 0}
+            playerData.lastSequence = data.sequence
+
+            -- Mark entity as dirty for broadcast
+            if playerData.entityId then
+                self.dirtyEntities[playerData.entityId] = true
+            end
+        -- Legacy input-based model (for compatibility)
+        elseif data.input then
+            playerData.lastInput = data.input
+            playerData.lastSequence = data.sequence
+
+            if self.onPlayerInput then
+                self.onPlayerInput(player, data.input, data.deltaTime)
+            end
         end
     end
 
@@ -243,21 +259,32 @@ function NetworkServer:spawnPlayerEntity(player: Player, characterType: string, 
     -- Add to entities
     self.entities[entityId] = entity
     playerData.entityId = entityId
-    playerData.position = position
 
-    -- Send spawn packet to all players
+    -- Convert Vector2 position to network format (table with x,y)
+    local positionTable = {
+        x = position.x,
+        y = position.y
+    }
+    playerData.position = positionTable
+
+    -- Send spawn packet to OTHER players only (not the new player)
+    -- The new player will receive their entity via WorldState
     local spawnData = {
         entityId = entityId,
         entityType = "player",
-        position = position,
+        position = positionTable,
         velocity = {x = 0, y = 0},
         playerId = playerData.playerId,
         data = characterType,
     }
 
-    Packets.EntitySpawn.sendToAll(spawnData)
+    for otherPlayer, _ in pairs(self.players) do
+        if otherPlayer ~= player then
+            Packets.EntitySpawn.sendTo(otherPlayer, spawnData)
+        end
+    end
 
-    -- Send player joined notification
+    -- Send player joined notification to all players
     Packets.PlayerJoined.sendToAll({
         playerId = playerData.playerId,
         entityId = entityId,
@@ -265,7 +292,7 @@ function NetworkServer:spawnPlayerEntity(player: Player, characterType: string, 
         characterData = characterType,
     })
 
-    -- Send current world state to the new player
+    -- Send current world state to the new player (includes their own entity)
     self:sendWorldState(player)
 
     print("Spawned player entity:", player.Name, entityId)
@@ -320,8 +347,19 @@ function NetworkServer:updateEntity(entityId: string, update: EntityUpdate)
     -- Mark entity as dirty for next update
     self.dirtyEntities[entityId] = true
 
-    -- Update server state (this would be expanded with actual component updates)
-    -- For now, we'll just track it for replication
+    -- Update player data if this is a player entity
+    for player, playerData in pairs(self.players) do
+        if playerData.entityId == entityId then
+            -- Update position and velocity for replication
+            if update.position then
+                playerData.position = update.position
+            end
+            if update.velocity then
+                playerData.velocity = update.velocity
+            end
+            break
+        end
+    end
 end
 
 function NetworkServer:sendWorldState(player: Player)
@@ -392,41 +430,66 @@ function NetworkServer:startSendLoop()
 
         self.lastSendTime = currentTime
 
-        -- Collect all dirty entity updates
+        -- Collect all dirty entity updates with owner information
         local updates = {}
+        local entityOwners = {} -- Map entityId -> owner Player
 
         for entityId, _ in pairs(self.dirtyEntities) do
             local entity = self.entities[entityId]
             if entity then
                 -- Find player data if this is a player entity
+                local ownerPlayer = nil
                 local playerData = nil
-                for _, pData in pairs(self.players) do
+                for player, pData in pairs(self.players) do
                     if pData.entityId == entityId then
                         playerData = pData
+                        ownerPlayer = player
                         break
                     end
                 end
 
                 if playerData then
-                    table.insert(updates, {
+                    local updateData = {
                         entityId = entityId,
                         position = playerData.position,
                         velocity = playerData.velocity,
                         state = "idle", -- This would come from actual state
-                    })
+                    }
+                    table.insert(updates, updateData)
+                    entityOwners[entityId] = ownerPlayer -- Track owner
                 end
             end
         end
 
-        -- Send batch update if there are any updates
+        -- Send updates to each player (excluding their own entity updates)
+        -- Local players use client-side prediction and should not receive their own position
         if #updates > 0 then
             self.sequence = self.sequence + 1
 
-            Packets.BatchEntityUpdate.sendToAll({
-                updates = updates,
-                sequence = self.sequence,
-                timestamp = currentTime,
-            })
+            if tick() % 2 < (1 / self.sendRate) then
+                print("[NETWORK] Broadcasting", #updates, "entity updates")
+            end
+
+            for player, _ in pairs(self.players) do
+                -- Filter out updates for this player's own entity to prevent prediction conflicts
+                local filteredUpdates = {}
+                for _, update in ipairs(updates) do
+                    local owner = entityOwners[update.entityId]
+                    if owner ~= player then
+                        -- Only send if this player is NOT the owner
+                        table.insert(filteredUpdates, update)
+                    end
+                end
+
+                -- Send batch update to this player if there are any relevant updates
+                if #filteredUpdates > 0 then
+                    Packets.BatchEntityUpdate.sendTo(player, {
+                        updates = filteredUpdates,
+                        sequence = self.sequence,
+                        timestamp = currentTime,
+                    })
+                end
+            end
 
             -- Clear dirty flags
             self.dirtyEntities = {}

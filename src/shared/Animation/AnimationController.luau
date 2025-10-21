@@ -192,9 +192,31 @@ function AnimationController:updateFrame()
         return
     end
 
+    -- Check for flip state stored as attributes
+    local flipX = self.imageLabel:GetAttribute("FlipX") or false
+    local flipY = self.imageLabel:GetAttribute("FlipY") or false
+
+    -- Calculate ImageRect values based on flip state
+    local offsetX = frame.x
+    local offsetY = frame.y
+    local sizeX = frame.width
+    local sizeY = frame.height
+
+    -- Apply horizontal flip: move offset to end of frame and use negative width
+    if flipX then
+        offsetX = frame.x + frame.width
+        sizeX = -frame.width
+    end
+
+    -- Apply vertical flip: move offset to end of frame and use negative height
+    if flipY then
+        offsetY = frame.y + frame.height
+        sizeY = -frame.height
+    end
+
     -- Apply to ImageLabel using ImageRectOffset and ImageRectSize
-    self.imageLabel.ImageRectOffset = RobloxVector2.new(frame.x, frame.y)
-    self.imageLabel.ImageRectSize = RobloxVector2.new(frame.width, frame.height)
+    self.imageLabel.ImageRectOffset = RobloxVector2.new(offsetX, offsetY)
+    self.imageLabel.ImageRectSize = RobloxVector2.new(sizeX, sizeY)
 
     -- Trigger frame change event
     if self.onFrameChange then

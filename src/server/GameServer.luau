@@ -102,19 +102,15 @@ function GameServer:setupNetworkCallbacks()
         -- Store the last input for this player
         self.playerLastInput[player] = input
 
-        local character = self.playerCharacters[player]
-        if character then
-            -- Don't process input here - it will be processed in the update loop
-            -- This prevents double processing and ensures consistent timing
+        local hasInput = input.moveLeft or input.moveRight or input.moveUp or input.moveDown
+        if hasInput and tick() % 2 < 0.033 then -- Print occasionally
+            print("[SERVER] Received input from", player.Name)
+        end
 
-            -- Update server-side position
-            local entityId = self.playerEntities[player]
-            if entityId then
-                local transform = self.entityManager:getComponent(entityId, "Transform")
-                if transform then
-                    transform.position = character.position
-                end
-            end
+        -- Mark the player's entity as dirty so it gets updated
+        local entityId = self.playerEntities[player]
+        if entityId then
+            self.networkServer.dirtyEntities[entityId] = true
         end
     end
 
@@ -258,10 +254,71 @@ function GameServer:resolveCollision(entityA: any, entityB: any, collision: any)
 end
 
 function GameServer:registerSystems()
+    -- CharacterController system - processes player movement
+    local CharacterControllerSystem = {
+        name = "CharacterController",
+        priority = 1,
+        requiredComponents = {"Transform", "Character"},
+        enabled = true,
+        update = function(system, entityManager, entities, deltaTime)
+            for _, entity in ipairs(entities) do
+                -- Find the player that owns this entity
+                local ownerPlayer = nil
+                for player, entityId in pairs(self.playerEntities) do
+                    if entityId == entity.id then
+                        ownerPlayer = player
+                        break
+                    end
+                end
+
+                if ownerPlayer then
+                    local character = self.playerCharacters[ownerPlayer]
+                    local inputState = self.playerLastInput[ownerPlayer]
+
+                    if character and inputState then
+                        -- Update character controller with input
+                        character:update(deltaTime, inputState)
+
+                        -- Update entity transform with character position
+                        local transform = entity.components.Transform
+                        if transform then
+                            transform.position = character.position
+
+                            -- Update network server's internal position tracking
+                            local playerData = self.networkServer.players[ownerPlayer]
+                            if playerData then
+                                -- Convert Vector2 to network format (table with x,y)
+                                playerData.position = {
+                                    x = character.position.x,
+                                    y = character.position.y
+                                }
+                                playerData.velocity = {
+                                    x = character.velocity.x,
+                                    y = character.velocity.y
+                                }
+
+                                -- Mark entity as dirty for network updates
+                                self.networkServer.dirtyEntities[entity.id] = true
+                            end
+                        end
+
+                        -- Update character component state
+                        local charComponent = entity.components.Character
+                        if charComponent then
+                            charComponent.state = character.state
+                            charComponent.health = character.health
+                            charComponent.facingDirection = character.facingDirection
+                        end
+                    end
+                end
+            end
+        end,
+    }
+
     -- Physics system
     local PhysicsSystem = {
         name = "Physics",
-        priority = 1,
+        priority = 2,
         requiredComponents = {"Transform", "Physics"},
         enabled = true,
         update = function(system, entityManager, entities, deltaTime)
@@ -298,7 +355,7 @@ function GameServer:registerSystems()
     -- AI System (for NPCs/Enemies)
     local AISystem = {
         name = "AI",
-        priority = 2,
+        priority = 3,
         requiredComponents = {"Transform", "AI"},
         enabled = true,
         update = function(system, entityManager, entities, deltaTime)
@@ -310,6 +367,7 @@ function GameServer:registerSystems()
         end,
     }
 
+    self.entityManager:registerSystem(CharacterControllerSystem)
     self.entityManager:registerSystem(PhysicsSystem)
     self.entityManager:registerSystem(AISystem)
 end
@@ -580,7 +638,7 @@ function GameServer:spawnPlayer(player: Player)
         state = "idle",
         health = 100,
         maxHealth = 100,
-        moveSpeed = 200,
+        moveSpeed = 120,  -- Reduced from 200
         jumpPower = 400,
         facingDirection = "right",
         isGrounded = true,
@@ -615,15 +673,15 @@ function GameServer:spawnPlayer(player: Player)
 
     -- Create character controller with top-down config (gravity = 0)
     local topDownConfig = {
-        moveSpeed = 200,
-        runSpeed = 350,
+        moveSpeed = 120,  -- Reduced from 200 for more controlled movement
+        runSpeed = 200,   -- Reduced from 350
         jumpPower = 0,
         airControl = 1.0,
         gravity = 0,  -- No gravity in top-down mode
         maxFallSpeed = 0,
         groundFriction = 10,
         airFriction = 0.5,
-        dashSpeed = 500,
+        dashSpeed = 400,  -- Reduced from 500
         dashDuration = 0.2,
         dashCooldown = 1,
         attackDuration = 0.3,
@@ -635,6 +693,18 @@ function GameServer:spawnPlayer(player: Player)
     character.position = spawnPos
     self.playerCharacters[player] = character
     self.playerEntities[player] = entityId
+
+    -- Initialize input state for new player
+    self.playerLastInput[player] = {
+        moveLeft = false,
+        moveRight = false,
+        moveUp = false,
+        moveDown = false,
+        jump = false,
+        attack = false,
+        interact = false,
+        dash = false,
+    }
 
     -- Notify network server to spawn player
     self.networkServer:spawnPlayerEntity(player, "default", spawnPos)
@@ -888,6 +958,9 @@ function GameServer:start()
     print("Starting Game Server...")
     self.running = true
 
+    -- Initialize lastTick to current time to prevent huge first deltaTime
+    self.lastTick = tick()
+
     -- Start network server
     self.networkServer:start()
 
@@ -928,48 +1001,89 @@ function GameServer:stop()
     end
 end
 
-function GameServer:update(deltaTime: number)
+function GameServer:update(_: number)
     -- Server tick rate limiting
     local currentTime = tick()
     local tickInterval = 1 / self.tickRate
     if currentTime - self.lastTick < tickInterval then
         return
     end
+
+    -- Calculate actual deltaTime since last tick (not frame deltaTime)
+    -- We don't use the passed deltaTime because it's per-frame, not per-tick
+    local actualDeltaTime = currentTime - self.lastTick
     self.lastTick = currentTime
 
-    -- Update character controllers with their last received input
+    -- Cap actualDeltaTime to prevent huge movements if server hiccups
+    actualDeltaTime = math.min(actualDeltaTime, 0.1) -- Max 100ms
+
+    -- FULLY CLIENT-AUTHORITATIVE MODEL
+    -- Client controls movement and collision at 60fps
+    -- Server just trusts and relays positions to other players
+    for player, character in pairs(self.playerCharacters) do
+        local entityId = self.playerEntities[player]
+        if entityId then
+            -- Get the authoritative position from NetworkServer (sent by client)
+            local playerData = self.networkServer.players[player]
+            if playerData and playerData.position then
+                -- Trust client's position (client already did collision detection at 60fps)
+                character.position = Vector2.new(playerData.position.x, playerData.position.y)
+
+                if playerData.velocity then
+                    character.velocity = Vector2.new(playerData.velocity.x, playerData.velocity.y)
+                end
+
+                -- Sync to transform
+                local transform = self.entityManager:getComponent(entityId, "Transform")
+                if transform then
+                    transform.position = character.position
+
+                    -- Update hitbox for server-side purposes (AI, etc.)
+                    self.hitboxSystem:updateHitbox(entityId, transform)
+
+                    -- Mark entity as dirty for replication to OTHER players
+                    self.networkServer:updateEntity(entityId, {
+                        entityId = entityId,
+                        position = character.position,
+                        velocity = character.velocity,
+                        state = character.state,
+                    })
+                end
+            end
+        end
+    end
+
+    -- OLD SERVER-AUTHORITATIVE MODEL (disabled - kept for reference)
+    --[[
     for player, character in pairs(self.playerCharacters) do
         local lastInput = self.playerLastInput[player] or {}
-        character:update(deltaTime, lastInput)
+        character:update(actualDeltaTime, lastInput)
 
-        -- Sync position to transform
         local entityId = self.playerEntities[player]
         if entityId then
             local transform = self.entityManager:getComponent(entityId, "Transform")
             if transform then
                 transform.position = character.position
+                self.networkServer:updateEntity(entityId, {
+                    entityId = entityId,
+                    position = character.position,
+                    velocity = character.velocity,
+                    state = character.state,
+                })
             end
         end
     end
+    ]]
 
-    -- Update ECS
-    self.entityManager:update(deltaTime)
+    -- Update ECS with actual deltaTime
+    self.entityManager:update(actualDeltaTime)
 end
 
 function GameServer:fixedUpdate(deltaTime: number)
-    -- Sync character controller positions to transforms
-    for player, character in pairs(self.playerCharacters) do
-        local entityId = self.playerEntities[player]
-        if entityId then
-            local transform = self.entityManager:getComponent(entityId, "Transform")
-            if transform then
-                transform.position = character.position
-            end
-        end
-    end
-
     -- Update physics and collision detection
     self.hitboxSystem:update()
+
+    -- Position syncing is now handled in update() to avoid duplication
 end
 
 function GameServer:destroy()

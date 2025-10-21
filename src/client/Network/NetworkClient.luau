@@ -60,8 +60,9 @@ function NetworkClient:connect()
     -- Start ping loop
     self:startPingLoop()
 
-    -- Request initial spawn
-    self:requestSpawn()
+    -- Server will automatically spawn the player when they join
+    -- No need to request spawn here (prevents race condition with server-side spawn)
+    -- self:requestSpawn()
 
     self.connected = true
 end
@@ -235,6 +236,24 @@ function NetworkClient:sendInput(input: InputState, deltaTime: number)
         input = input,
         sequence = self.sequence,
         deltaTime = deltaTime,
+    })
+end
+
+function NetworkClient:sendPositionUpdate(position: Vector2, velocity: Vector2, state: string?)
+    if not self.connected then
+        return
+    end
+
+    self.sequence = self.sequence + 1
+
+    -- Send client-authoritative position update to server
+    -- Client has already processed movement/collision at 60fps
+    Packets.PlayerInput.send({
+        position = position,
+        velocity = velocity,
+        state = state or "idle",
+        sequence = self.sequence,
+        timestamp = tick(),
     })
 end
 

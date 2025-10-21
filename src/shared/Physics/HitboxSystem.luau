@@ -66,6 +66,8 @@ function HitboxSystem.new()
     -- Debug visualization
     self.debugDraw = false
     self.debugFrames = {} :: {[string]: Frame}
+    self.debugScreenGui = nil :: ScreenGui?
+    self.worldRenderer = nil :: any? -- Reference to WorldRenderer for coordinate conversion
 
     return self
 end
@@ -172,10 +174,32 @@ end
 function HitboxSystem:getGridCells(bounds: Rectangle): {string}
     local cells = {}
 
+    -- Validate bounds to prevent extreme values
+    if bounds.width > 100000 or bounds.height > 100000 then
+        warn("HitboxSystem: Extremely large bounds detected", bounds.width, bounds.height, "- skipping grid calculation")
+        return cells
+    end
+
     local minX = math.floor(bounds.x / self.cellSize)
     local maxX = math.floor((bounds.x + bounds.width) / self.cellSize)
     local minY = math.floor(bounds.y / self.cellSize)
     local maxY = math.floor((bounds.y + bounds.height) / self.cellSize)
+
+    -- Safety check: prevent creating too many cells (e.g., if bounds are extreme)
+    local cellCountX = maxX - minX + 1
+    local cellCountY = maxY - minY + 1
+    local totalCells = cellCountX * cellCountY
+
+    if totalCells > 10000 then
+        warn("HitboxSystem: Too many grid cells requested:", totalCells, "- bounds:", bounds, "- clamping")
+        -- Clamp to a reasonable range around the center
+        local centerX = math.floor((minX + maxX) / 2)
+        local centerY = math.floor((minY + maxY) / 2)
+        minX = centerX - 50
+        maxX = centerX + 50
+        minY = centerY - 50
+        maxY = centerY + 50
+    end
 
     for x = minX, maxX do
         for y = minY, maxY do
@@ -265,6 +289,7 @@ function HitboxSystem:calculatePenetration(boundsA: Rectangle, boundsB: Rectangl
     local centerA = Rectangle.getCenter(boundsA)
     local centerB = Rectangle.getCenter(boundsB)
 
+    -- Vector from A to B
     local dx = centerB.x - centerA.x
     local dy = centerB.y - centerA.y
 
@@ -276,15 +301,18 @@ function HitboxSystem:calculatePenetration(boundsA: Rectangle, boundsB: Rectangl
     local overlapX = halfWidthA + halfWidthB - math.abs(dx)
     local overlapY = halfHeightA + halfHeightB - math.abs(dy)
 
+    -- Return penetration vector to separate A from B
+    -- If dx > 0 (B is right of A), push A to the LEFT (negative X)
+    -- If dx < 0 (B is left of A), push A to the RIGHT (positive X)
     if overlapX < overlapY then
         return Vector2.new(
-            if dx > 0 then overlapX else -overlapX,
+            if dx > 0 then -overlapX else overlapX,  -- FIXED: reversed signs
             0
         )
     else
         return Vector2.new(
             0,
-            if dy > 0 then overlapY else -overlapY
+            if dy > 0 then -overlapY else overlapY  -- FIXED: reversed signs
         )
     end
 end
@@ -352,6 +380,13 @@ function HitboxSystem:update()
             end
         end
     end
+
+    -- Draw debug hitboxes if enabled
+    if self.debugDraw and self.debugScreenGui then
+        for entityId, _ in pairs(self.hitboxes) do
+            self:drawDebugHitbox(entityId, self.debugScreenGui)
+        end
+    end
 end
 
 function HitboxSystem:triggerCallbacks(callbacks: {[string]: (CollisionInfo) -> ()} | ((CollisionInfo) -> ()), collision: CollisionInfo)
@@ -384,8 +419,10 @@ function HitboxSystem:triggerCallbacks(callbacks: {[string]: (CollisionInfo) -> 
     end
 end
 
-function HitboxSystem:setDebugDraw(enabled: boolean, screenGui: ScreenGui?)
+function HitboxSystem:setDebugDraw(enabled: boolean, screenGui: any?, worldRenderer: any?)
     self.debugDraw = enabled
+    self.debugScreenGui = screenGui
+    self.worldRenderer = worldRenderer
 
     if not enabled then
         -- Clean up all debug frames
@@ -396,7 +433,7 @@ function HitboxSystem:setDebugDraw(enabled: boolean, screenGui: ScreenGui?)
     end
 end
 
-function HitboxSystem:drawDebugHitbox(entityId: string, screenGui: ScreenGui)
+function HitboxSystem:drawDebugHitbox(entityId: string, screenGui: any)
     local data = self.hitboxes[entityId]
     if not data then
         return
@@ -410,14 +447,33 @@ function HitboxSystem:drawDebugHitbox(entityId: string, screenGui: ScreenGui)
         frame.BackgroundTransparency = 0.7
         frame.BorderSizePixel = 2
         frame.BorderColor3 = Color3.new(1, 1, 0)
+        frame.ZIndex = 3000 -- Draw on top of everything
         frame.Parent = screenGui
         self.debugFrames[entityId] = frame
     end
 
-    -- Update frame position and size based on world bounds
+    -- Convert world bounds to screen space
     local bounds = data.worldBounds
-    frame.Position = UDim2.fromOffset(bounds.x, bounds.y)
-    frame.Size = UDim2.fromOffset(bounds.width, bounds.height)
+    local topLeft = Vector2.new(bounds.x, bounds.y)
+    local size = Vector2.new(bounds.width, bounds.height)
+
+    -- If we have a WorldRenderer, use it to convert coordinates
+    if self.worldRenderer then
+        local screenTopLeft = self.worldRenderer:worldToScreen(topLeft)
+        local screenBottomRight = self.worldRenderer:worldToScreen(
+            Vector2.new(bounds.x + bounds.width, bounds.y + bounds.height)
+        )
+        local screenSize = Vector2.subtract(screenBottomRight, screenTopLeft)
+
+        frame.Position = UDim2.fromOffset(screenTopLeft.x, screenTopLeft.y)
+        frame.Size = UDim2.fromOffset(math.abs(screenSize.x), math.abs(screenSize.y))
+        frame.Visible = true
+    else
+        -- Fallback to world coordinates (will only work if camera is at origin)
+        frame.Position = UDim2.fromOffset(bounds.x, bounds.y)
+        frame.Size = UDim2.fromOffset(bounds.width, bounds.height)
+        frame.Visible = true
+    end
 end
 
 -- Static utility functions

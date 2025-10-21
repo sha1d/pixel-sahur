@@ -51,7 +51,10 @@ function GameClient.new()
     self.inputSendRate = 1/60 -- Send input 60 times per second
 
     -- Debug
-    self.debugMode = false
+    self.debugMode = false -- Will be enabled in initialize()
+
+    -- MEMORY LEAK FIX: Store connections for cleanup
+    self.debugInputConnection = nil :: RBXScriptConnection?
 
     return self
 end
@@ -103,6 +106,12 @@ function GameClient:setupNetworkCallbacks()
     self.networkClient.onEntitySpawn = function(entityId: string, data: any)
         print("Entity spawned:", entityId, "Type:", data.entityType or "player")
 
+        -- Check if entity already exists - if so, skip spawning
+        if self.entityManager:getEntity(entityId) then
+            warn("Entity already exists:", entityId, "- skipping spawn")
+            return
+        end
+
         -- Create entity in ECS
         local entity = self.entityManager:createEntity(entityId)
 
@@ -110,9 +119,10 @@ function GameClient:setupNetworkCallbacks()
         local entityType = data.entityType or "player"
         local isObstacle = entityType == "obstacle" or entityType == "wall"
 
-        -- Add transform component
+        -- Add transform component (convert network position to Vector2)
+        local position = Vector2.new(data.position.x, data.position.y)
         self.entityManager:addComponent(entityId, "Transform", {
-            position = data.position,
+            position = position,
             rotation = 0,
             scale = Vector2.one(),
             zIndex = if isObstacle then 5 else 10,
@@ -151,17 +161,33 @@ function GameClient:setupNetworkCallbacks()
             if renderer then
                 renderer.BackgroundColor3 = color
                 renderer.BackgroundTransparency = 0
-                print("Created obstacle renderer:", entityId, "at", data.position.x, data.position.y, "size", size.x, size.y, "color", color)
+                print("Created obstacle renderer:", entityId, "at", position.x, position.y, "size", size.x, size.y, "color", color)
             end
         else
             -- Create sprite renderer for players/entities
             self.worldRenderer:createEntityRenderer(entityId, imageId, size)
         end
 
-        -- Immediately set position for obstacles (they don't move)
-        if isObstacle and self.worldRenderer then
+        -- Add hitbox for obstacles and walls
+        if isObstacle then
+            self.entityManager:addComponent(entityId, "Hitbox", {
+                size = size,
+                offset = Vector2.zero(),
+                isTrigger = false,
+                layer = 6, -- Wall layer
+                mask = bit32.lshift(1, 1), -- Collides with Player layer
+                debugDraw = self.debugMode,
+            })
+
+            -- Register hitbox with HitboxSystem
             local transform = self.entityManager:getComponent(entityId, "Transform")
-            if transform then
+            local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+            if transform and hitbox then
+                self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
+            end
+
+            -- Immediately set position for obstacles (they don't move)
+            if self.worldRenderer then
                 self.worldRenderer:updateEntityPosition(entityId, transform.position)
             end
         end
@@ -173,10 +199,10 @@ function GameClient:setupNetworkCallbacks()
                 frameWidth = 64,
                 frameHeight = 64,
                 animations = {
-                    idle = { startFrame = 0, endFrame = 4, frameRate = 10, loop = true },
-                    right = { startFrame = 5, endFrame = 8, frameRate = 10, loop = true },  -- Used for both left (flipped) and right
-                    up = { startFrame = 13, endFrame = 16, frameRate = 10, loop = true },
-                    down = { startFrame = 9, endFrame = 12, frameRate = 10, loop = true },
+                    idle = { startFrame = 0, endFrame = 4, frameRate = 8, loop = true },
+                    right = { startFrame = 5, endFrame = 8, frameRate = 12, loop = true },  -- Used for both left (flipped) and right
+                    up = { startFrame = 13, endFrame = 16, frameRate = 12, loop = true },
+                    down = { startFrame = 9, endFrame = 12, frameRate = 12, loop = true },
                 }
             })
 
@@ -195,7 +221,7 @@ function GameClient:setupNetworkCallbacks()
                 state = "idle",
                 health = 100,
                 maxHealth = 100,
-                moveSpeed = 200,
+                moveSpeed = 120,  -- Reduced from 200
                 jumpPower = 400,
                 facingDirection = "right",
                 isGrounded = false,
@@ -203,10 +229,10 @@ function GameClient:setupNetworkCallbacks()
                 canJump = true,
             })
 
-            -- Add hitbox component
+            -- Add hitbox component (smaller, tighter hitbox for better gameplay feel)
             self.entityManager:addComponent(entityId, "Hitbox", {
-                size = Vector2.new(48, 60),
-                offset = Vector2.zero(),
+                size = Vector2.new(28, 36), -- Tight hitbox: 28 wide x 36 tall
+                offset = Vector2.new(0, 4), -- Center on character body
                 isTrigger = false,
                 layer = 1, -- Player layer
                 mask = bit32.bor(bit32.lshift(1, 2), bit32.lshift(1, 6)), -- Collides with enemies and walls
@@ -215,15 +241,15 @@ function GameClient:setupNetworkCallbacks()
 
             -- Create CharacterController for player entities
             local charController = CharacterController.new(entityId, {
-                moveSpeed = 200,
-                runSpeed = 350,
+                moveSpeed = 120,  -- Reduced from 200 for more controlled movement
+                runSpeed = 200,   -- Reduced from 350
                 jumpPower = 0, -- Not used in top-down
                 airControl = 1,
                 gravity = 0, -- Top-down 2D (no gravity)
                 maxFallSpeed = 0,
                 groundFriction = 8, -- Friction for smooth stopping
                 airFriction = 0,
-                dashSpeed = 500,
+                dashSpeed = 400,  -- Reduced from 500
                 dashDuration = 0.2,
                 dashCooldown = 1,
                 attackDuration = 0.3,
@@ -241,6 +267,12 @@ function GameClient:setupNetworkCallbacks()
             -- Store character controller
             self.characterControllers[entityId] = charController
 
+            -- Register player hitbox with HitboxSystem
+            local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+            if transform and hitbox then
+                self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
+            end
+
             -- If this is the local player
             if data.playerId == tostring(self.localPlayer.UserId) then
                 self.localEntityId = entityId
@@ -253,6 +285,14 @@ function GameClient:setupNetworkCallbacks()
     -- Entity despawned
     self.networkClient.onEntityDespawn = function(entityId: string)
         print("Entity despawned:", entityId)
+
+        -- Unregister hitbox from HitboxSystem
+        self.hitboxSystem:unregisterHitbox(entityId)
+
+        -- Remove character controller
+        if self.characterControllers[entityId] then
+            self.characterControllers[entityId] = nil
+        end
 
         -- Remove renderer
         self.worldRenderer:removeEntityRenderer(entityId)
@@ -269,32 +309,35 @@ function GameClient:setupNetworkCallbacks()
 
     -- Entity update
     self.networkClient.onEntityUpdate = function(entityId: string, update: Types.EntityUpdate)
+        if update.position and tick() % 2 < 0.016 then
+            print("[CLIENT] Received update for", entityId, "pos:", math.floor(update.position.x), math.floor(update.position.y))
+        end
+
         -- Update entity components
         local transform = self.entityManager:getComponent(entityId, "Transform")
         if transform and update.position then
-            transform.position = update.position
-        end
+            -- Convert network position to Vector2
+            local newPosition = Vector2.new(update.position.x, update.position.y)
+            transform.position = newPosition
 
-        -- If this is the local player, also update the character controller
-        if entityId == self.localEntityId and update.position then
-            local charController = self.characterControllers[entityId]
-            if charController then
-                -- Calculate distance between current position and correction
-                local dx = update.position.x - charController.position.x
-                local dy = update.position.y - charController.position.y
-                local distance = math.sqrt(dx * dx + dy * dy)
+            -- Update visual position immediately for non-local players
+            if entityId ~= self.localEntityId and self.worldRenderer then
+                self.worldRenderer:updateEntityPosition(entityId, newPosition)
 
-                -- Only apply correction if distance is significant (> 5 pixels)
-                -- This prevents micro-corrections from interfering with smooth movement
-                if distance > 5 then
-                    charController.position = update.position
-                    -- Also update velocity
+                -- Also update character controller for animations
+                local charController = self.characterControllers[entityId]
+                if charController then
+                    charController.position = newPosition
                     if update.velocity then
-                        charController.velocity = update.velocity
+                        charController.velocity = Vector2.new(update.velocity.x, update.velocity.y)
                     end
                 end
             end
         end
+
+        -- Local player is fully client-authoritative - ignore server position updates
+        -- Server only relays our position to other players, doesn't send corrections back
+        -- (This prevents jitter and teleporting from delayed server corrections)
 
         if update.state then
             local character = self.entityManager:getComponent(entityId, "Character")
@@ -307,6 +350,27 @@ function GameClient:setupNetworkCallbacks()
             local character = self.entityManager:getComponent(entityId, "Character")
             if character then
                 character.health = update.health
+            end
+        end
+    end
+
+    -- World state (for late joiners to see existing entities)
+    self.networkClient.onWorldState = function(state: any)
+        print("Received world state with", #state.entities, "entities")
+
+        -- Spawn all entities from world state
+        for _, entityData in ipairs(state.entities) do
+            -- Skip if this entity already exists (like our own player)
+            if self.entityManager:getEntity(entityData.entityId) then
+                print("Skipping already existing entity:", entityData.entityId)
+                continue
+            end
+
+            print("Spawning entity from world state:", entityData.entityId, "Type:", entityData.entityType)
+
+            -- Call the entity spawn handler to create the entity
+            if self.networkClient.onEntitySpawn then
+                self.networkClient.onEntitySpawn(entityData.entityId, entityData)
             end
         end
     end
@@ -332,10 +396,10 @@ function GameClient:setupInputCallbacks()
         end
     end)
 
-    -- Debug toggle
-    self.inputManager:bindAction("debug", {Enum.KeyCode.F3}, nil)
-    self.inputManager:onAction("debug", function(pressed)
-        if pressed then
+    -- Debug toggle - Use direct UserInputService binding to avoid conflicts
+    local UserInputService = game:GetService("UserInputService")
+    self.debugInputConnection = UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+        if input.KeyCode == Enum.KeyCode.U and not gameProcessedEvent then
             self:toggleDebugMode()
         end
     end)
@@ -344,8 +408,12 @@ end
 function GameClient:setupLocalPlayer(entityId: string)
     print("Setting up local player:", entityId)
 
-    -- Create character controller
-    self.localCharacter = CharacterController.new(entityId)
+    -- Get the existing character controller (already created in spawn callback)
+    self.localCharacter = self.characterControllers[entityId]
+    if not self.localCharacter then
+        warn("No character controller found for local player:", entityId)
+        return
+    end
 
     -- Set camera to follow player
     self.camera:follow(entityId)
@@ -386,28 +454,92 @@ function GameClient:registerSystems()
                     continue
                 end
 
-                -- Get input state (only for local player)
-                local inputState = {
-                    moveLeft = false,
-                    moveRight = false,
-                    moveUp = false,
-                    moveDown = false,
-                    jump = false,
-                    attack = false,
-                    interact = false,
-                    dash = false,
-                }
-
-                if entity.id == self.localEntityId and self.inputManager then
-                    inputState = self.inputManager.inputState
-                end
-
-                -- Update character controller
-                charController:update(deltaTime, inputState)
-
-                -- Sync transform with character controller
+                -- Get transform component
                 local transform = entity.components.Transform
-                transform.position = charController.position
+
+                -- Only update character controller for local player
+                -- Remote players get their positions from server updates
+                if entity.id == self.localEntityId then
+                    -- Get input state for local player
+                    local inputState = {
+                        moveLeft = false,
+                        moveRight = false,
+                        moveUp = false,
+                        moveDown = false,
+                        jump = false,
+                        attack = false,
+                        interact = false,
+                        dash = false,
+                    }
+
+                    if self.inputManager then
+                        inputState = self.inputManager.inputState
+                    end
+
+                    -- Track blocked directions from collisions
+                    local blockedX = false
+                    local blockedY = false
+
+                    -- Update character controller with input
+                    charController:update(deltaTime, inputState)
+
+                    -- Sync transform with character controller for local player
+                    transform.position = charController.position
+
+                    -- Update hitbox BEFORE collision check
+                    local hitbox = entity.components.Hitbox
+                    if hitbox then
+                        self.hitboxSystem:updateHitbox(entity.id, transform)
+
+                        -- CLIENT-SIDE COLLISION DETECTION (before sending to server!)
+                        local nearbyEntities = self.hitboxSystem:getNearbyEntities(entity.id)
+                        for _, otherId in ipairs(nearbyEntities) do
+                            local collision = self.hitboxSystem:checkCollision(entity.id, otherId)
+                            if collision and not collision.isTrigger then
+                                -- Resolve collision by pushing player back
+                                -- penetration already points in the correction direction
+                                charController.position = Vector2.add(charController.position, collision.penetration)
+                                transform.position = charController.position
+
+                                -- Determine which axis is blocked based on collision normal
+                                if math.abs(collision.normal.x) > 0.5 then
+                                    blockedX = true
+                                end
+                                if math.abs(collision.normal.y) > 0.5 then
+                                    blockedY = true
+                                end
+
+                                -- Stop velocity in the direction of collision
+                                -- When moving into a wall, velocity dot normal is negative
+                                local normalDot = Vector2.dot(charController.velocity, collision.normal)
+                                if normalDot < 0 then
+                                    -- Remove the velocity component moving into the wall
+                                    local velocityCorrection = Vector2.multiply(collision.normal, normalDot)
+                                    charController.velocity = Vector2.subtract(charController.velocity, velocityCorrection)
+                                end
+
+                                -- Update hitbox position after correction
+                                self.hitboxSystem:updateHitbox(entity.id, transform)
+                            end
+                        end
+
+                        -- If movement was blocked, zero out velocity in blocked directions completely
+                        if blockedX or blockedY then
+                            charController.velocity = Vector2.new(
+                                blockedX and 0 or charController.velocity.x,
+                                blockedY and 0 or charController.velocity.y
+                            )
+                        end
+                    end
+
+                    -- NOW send validated position to server (after collision resolution)
+                    self:sendInputToServer(inputState)
+                else
+                    -- For remote players, sync character controller position with server transform
+                    -- This ensures the character controller's internal state matches server position
+                    -- Transform position is already a Vector2, so we can assign it directly
+                    charController.position = transform.position
+                end
 
                 -- Sync character component state
                 local character = entity.components.Character
@@ -419,11 +551,6 @@ function GameClient:registerSystems()
                 -- Update position for rendering
                 if self.worldRenderer then
                     self.worldRenderer:updateEntityPosition(entity.id, transform.position)
-                end
-
-                -- Send input to server (only for local player)
-                if entity.id == self.localEntityId then
-                    self:sendInputToServer(inputState)
                 end
             end
         end,
@@ -455,7 +582,8 @@ function GameClient:registerSystems()
                 local velocity = charController.velocity
                 local speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
 
-                if speed > 10 then
+                -- Use a higher threshold (5 px/s) to prevent animation flickering when barely moving
+                if speed > 5 then
                     -- Character is moving - determine direction based on velocity
                     if math.abs(velocity.x) > math.abs(velocity.y) then
                         -- Horizontal movement dominant
@@ -586,7 +714,15 @@ function GameClient:update(deltaTime: number)
         self.localCharacter:update(deltaTime, inputState)
 
         -- Send input to server
+        local hasInput = inputState.moveLeft or inputState.moveRight or inputState.moveUp or inputState.moveDown
+        if hasInput and tick() % 2 < deltaTime then -- Print every ~2 seconds when moving
+            print("[CLIENT] Sending input - LocalChar exists:", self.localCharacter ~= nil, "Connected:", self.networkClient.connected)
+        end
         self.networkClient:sendInput(inputState, deltaTime)
+    else
+        if tick() % 3 < deltaTime then
+            print("[CLIENT] WARNING: No localCharacter! EntityID:", self.localEntityId)
+        end
     end
 
     -- Update ECS
@@ -612,7 +748,7 @@ function GameClient:fixedUpdate(deltaTime: number)
 end
 
 function GameClient:sendInputToServer(inputState: any)
-    -- Throttle input sending to reduce network traffic
+    -- Throttle position updates to reduce network traffic
     local currentTime = tick()
     if currentTime - self.lastInputSendTime < self.inputSendRate then
         return
@@ -620,11 +756,15 @@ function GameClient:sendInputToServer(inputState: any)
 
     self.lastInputSendTime = currentTime
 
-    -- Send input state to server for server-side validation
-    if self.networkClient and self.localEntityId then
-        -- Use the NetworkClient's sendInput method
-        -- It handles sequencing and buffering internally
-        self.networkClient:sendInput(inputState, self.deltaTime)
+    -- Send authoritative position/velocity to server (client-authoritative model)
+    -- Client has already processed movement and collision at 60fps with full accuracy
+    if self.networkClient and self.localEntityId and self.localCharacter then
+        -- Send position update with velocity for smooth interpolation on other clients
+        self.networkClient:sendPositionUpdate(
+            self.localCharacter.position,
+            self.localCharacter.velocity,
+            self.localCharacter.state
+        )
     end
 end
 
@@ -640,7 +780,9 @@ function GameClient:toggleDebugMode()
 
     -- Update hitbox debug visualization
     if self.hitboxSystem then
-        self.hitboxSystem:setDebugDraw(self.debugMode, self.screenGui)
+        -- Get the debug container from WorldRenderer instead of screenGui
+        local debugContainer = self.worldRenderer.debugContainer
+        self.hitboxSystem:setDebugDraw(self.debugMode, debugContainer, self.worldRenderer)
     end
 
     -- Update entity manager debug
@@ -653,6 +795,12 @@ end
 
 function GameClient:destroy()
     self:stop()
+
+    -- MEMORY LEAK FIX: Disconnect debug input connection
+    if self.debugInputConnection then
+        self.debugInputConnection:Disconnect()
+        self.debugInputConnection = nil
+    end
 
     -- Clean up all systems
     if self.networkClient then

@@ -88,6 +88,7 @@ function WorldRenderer.new(screenGui: ScreenGui, config: RenderConfig?)
     -- Performance
     self.visibleEntities = {} :: {[string]: boolean}
     self.cullingEnabled = true
+    self.cullingMargin = 200 -- Extra pixels in world space to keep objects rendered beyond screen bounds
     self.batchRendering = true
 
     -- Debug
@@ -95,6 +96,15 @@ function WorldRenderer.new(screenGui: ScreenGui, config: RenderConfig?)
     self.showFPS = false
     self.showEntityCount = false
     self.fpsLabel = nil :: TextLabel?
+
+    -- MEMORY LEAK FIX: Store connections for cleanup
+    self.resizeConnection = nil :: RBXScriptConnection?
+    self.debugConnection = nil :: RBXScriptConnection?
+
+    -- Resize debouncing
+    self.resizeDebounceTime = 0.1 -- 100ms debounce
+    self.lastResizeTime = 0
+    self.resizeScheduled = false
 
     -- Initialize
     self:initialize()
@@ -149,9 +159,10 @@ function WorldRenderer:initialize()
     -- Set up viewport scaling
     self:updateViewportScale()
 
-    -- Listen for screen size changes
-    self.screenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-        self:updateViewportScale()
+    -- Listen for screen size changes with debouncing
+    -- PERFORMANCE FIX: Debounce screen size changes to prevent jitter during window resize
+    self.resizeConnection = self.screenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        self:scheduleViewportUpdate()
     end)
 end
 
@@ -183,6 +194,30 @@ function WorldRenderer:createLayer(name: string, zIndex: number, parallaxFactor:
     end)
 
     return layer
+end
+
+function WorldRenderer:scheduleViewportUpdate()
+    -- PERFORMANCE FIX: Debounce viewport updates during rapid screen size changes
+    -- This prevents jitter and performance issues when dragging window or going fullscreen
+    local currentTime = tick()
+    self.lastResizeTime = currentTime
+
+    if not self.resizeScheduled then
+        self.resizeScheduled = true
+
+        task.delay(self.resizeDebounceTime, function()
+            -- Check if enough time has passed since last resize
+            if tick() - self.lastResizeTime >= self.resizeDebounceTime then
+                -- Enough time passed, update viewport
+                self:updateViewportScale()
+                self.resizeScheduled = false
+            else
+                -- More resizes happened during debounce, reschedule
+                self.resizeScheduled = false
+                self:scheduleViewportUpdate()
+            end
+        end)
+    end
 end
 
 function WorldRenderer:updateViewportScale()
@@ -227,6 +262,9 @@ function WorldRenderer:updateViewportScale()
 
     -- Update camera viewport
     self.camera.viewport = self.viewport
+
+    -- Update all entity renderer sizes to match new scale
+    self:updateAllEntitySizes()
 end
 
 function WorldRenderer:createEntityRenderer(entityId: string, imageId: string, size: Vector2Type, layer: string?)
@@ -235,6 +273,12 @@ function WorldRenderer:createEntityRenderer(entityId: string, imageId: string, s
     if not layerData then
         warn("Layer not found:", layer)
         return nil
+    end
+
+    -- Check if renderer already exists - if so, return existing one
+    if self.entityRenderers[entityId] then
+        warn("Entity renderer already exists for:", entityId, "- returning existing renderer")
+        return self.entityRenderers[entityId]
     end
 
     local imageLabel = Instance.new("ImageLabel")
@@ -256,6 +300,10 @@ function WorldRenderer:createEntityRenderer(entityId: string, imageId: string, s
     imageLabel.BorderSizePixel = 0
     imageLabel.ScaleType = Enum.ScaleType.Fit
     imageLabel.AnchorPoint = RobloxVector2.new(0.5, 0.5)
+
+    -- Store original world size as attributes for future scale updates
+    imageLabel:SetAttribute("WorldWidth", size.x)
+    imageLabel:SetAttribute("WorldHeight", size.y)
 
     -- Apply pixel-perfect rendering
     if self.config.pixelPerfect then
@@ -284,6 +332,13 @@ function WorldRenderer:setupEntityAnimation(entityId: string, config: {
     if not renderer then
         warn("Cannot setup animation: renderer not found for entity", entityId)
         return nil
+    end
+
+    -- MEMORY LEAK FIX: Destroy existing animation controller if it exists
+    -- This prevents accumulation of RunService.Heartbeat connections
+    if self.entityAnimations[entityId] then
+        self.entityAnimations[entityId]:destroy()
+        self.entityAnimations[entityId] = nil
     end
 
     -- Import AnimationController (local to avoid global pollution)
@@ -340,45 +395,48 @@ function WorldRenderer:setEntityFlip(entityId: string, flipX: boolean, flipY: bo
         return
     end
 
-    -- Get current ImageRect values
-    local currentOffset = renderer.ImageRectOffset
-    local currentSize = renderer.ImageRectSize
+    -- Store flip state as attributes so AnimationController can respect it
+    renderer:SetAttribute("FlipX", flipX)
+    renderer:SetAttribute("FlipY", if flipY ~= nil then flipY else false)
 
-    -- Store original ImageRect if not already stored
-    if not renderer:GetAttribute("OriginalRectOffsetX") then
-        renderer:SetAttribute("OriginalRectOffsetX", currentOffset.X)
-        renderer:SetAttribute("OriginalRectOffsetY", currentOffset.Y)
-        renderer:SetAttribute("OriginalRectSizeX", currentSize.X)
-        renderer:SetAttribute("OriginalRectSizeY", currentSize.Y)
+    -- Get the animation controller for this entity
+    local animController = self.entityAnimations[entityId]
+    if animController then
+        -- If there's an animation playing, trigger a frame update to apply the flip
+        animController:updateFrame()
+    else
+        -- No animation controller, apply flip directly to current ImageRect
+        local currentOffset = renderer.ImageRectOffset
+        local currentSize = renderer.ImageRectSize
+
+        -- Calculate new ImageRect values based on flip state
+        local newOffsetX = currentOffset.X
+        local newOffsetY = currentOffset.Y
+        local newSizeX = currentSize.X
+        local newSizeY = currentSize.Y
+
+        -- Flip horizontally: move offset to end of image and use negative width
+        if flipX and newSizeX > 0 then
+            newOffsetX = currentOffset.X + currentSize.X
+            newSizeX = -currentSize.X
+        elseif not flipX and newSizeX < 0 then
+            newOffsetX = currentOffset.X + currentSize.X
+            newSizeX = -currentSize.X
+        end
+
+        -- Flip vertically: move offset to end of image and use negative height
+        if flipY and newSizeY > 0 then
+            newOffsetY = currentOffset.Y + currentSize.Y
+            newSizeY = -currentSize.Y
+        elseif not flipY and newSizeY < 0 then
+            newOffsetY = currentOffset.Y + currentSize.Y
+            newSizeY = -currentSize.Y
+        end
+
+        -- Apply the flipped ImageRect
+        renderer.ImageRectOffset = RobloxVector2.new(newOffsetX, newOffsetY)
+        renderer.ImageRectSize = RobloxVector2.new(newSizeX, newSizeY)
     end
-
-    -- Get original values
-    local origOffsetX = renderer:GetAttribute("OriginalRectOffsetX") or 0
-    local origOffsetY = renderer:GetAttribute("OriginalRectOffsetY") or 0
-    local origSizeX = renderer:GetAttribute("OriginalRectSizeX") or 64
-    local origSizeY = renderer:GetAttribute("OriginalRectSizeY") or 64
-
-    -- Calculate new ImageRect values based on flip state
-    local newOffsetX = origOffsetX
-    local newOffsetY = origOffsetY
-    local newSizeX = origSizeX
-    local newSizeY = origSizeY
-
-    -- Flip horizontally: move offset to end of image and use negative width
-    if flipX then
-        newOffsetX = origOffsetX + origSizeX
-        newSizeX = -origSizeX
-    end
-
-    -- Flip vertically: move offset to end of image and use negative height
-    if flipY then
-        newOffsetY = origOffsetY + origSizeY
-        newSizeY = -origSizeY
-    end
-
-    -- Apply the flipped ImageRect
-    renderer.ImageRectOffset = RobloxVector2.new(newOffsetX, newOffsetY)
-    renderer.ImageRectSize = RobloxVector2.new(newSizeX, newSizeY)
 end
 
 function WorldRenderer:removeEntityRenderer(entityId: string)
@@ -533,6 +591,22 @@ function WorldRenderer:updateAllEntityScales()
     end
 end
 
+function WorldRenderer:updateAllEntitySizes()
+    -- Update all entity renderer sizes based on current scale factor
+    -- This is needed when the viewport scale changes (e.g., window resize, fullscreen)
+    for entityId, renderer in pairs(self.entityRenderers) do
+        -- Get the original world size from attributes
+        local worldWidth = renderer:GetAttribute("WorldWidth")
+        local worldHeight = renderer:GetAttribute("WorldHeight")
+
+        if worldWidth and worldHeight then
+            local scaledWidth = math.max(1, math.abs(worldWidth * self.scaleFactor * self.camera.zoom))
+            local scaledHeight = math.max(1, math.abs(worldHeight * self.scaleFactor * self.camera.zoom))
+            renderer.Size = UDim2.fromOffset(scaledWidth, scaledHeight)
+        end
+    end
+end
+
 function WorldRenderer:performCulling(entities: {[string]: {position: Vector2Type, size: Vector2Type}})
     if not self.cullingEnabled then
         return
@@ -547,6 +621,10 @@ function WorldRenderer:performCulling(entities: {[string]: {position: Vector2Typ
     )
     screenBounds = Rectangle.translate(screenBounds, self.camera.position)
 
+    -- Expand screen bounds with margin to prevent objects from popping in/out at screen edges
+    -- This keeps objects rendered slightly beyond the visible area for smooth transitions
+    screenBounds = Rectangle.expand(screenBounds, self.cullingMargin)
+
     -- Cull entities outside visible bounds
     for entityId, entityData in pairs(entities) do
         local entityBounds = Rectangle.fromCenter(entityData.position, entityData.size)
@@ -560,23 +638,40 @@ function WorldRenderer:performCulling(entities: {[string]: {position: Vector2Typ
     end
 end
 
+function WorldRenderer:setCullingMargin(margin: number)
+    -- Set the culling margin (in world space pixels)
+    -- Higher values keep objects rendered further beyond screen edges
+    -- Lower values improve performance but may cause visible pop-in/pop-out
+    self.cullingMargin = math.max(0, margin)
+end
+
 function WorldRenderer:setDebugMode(enabled: boolean)
     self.debugMode = enabled
     if self.debugContainer then
         self.debugContainer.Visible = enabled
     end
 
-    if enabled and not self.fpsLabel then
-        self:createDebugUI()
+    -- MEMORY LEAK FIX: Clean up existing debug connection before creating new one
+    if enabled then
+        if not self.fpsLabel then
+            self:createDebugUI()
+        end
+    else
+        -- When disabling debug mode, clean up the debug connection
+        if self.debugConnection then
+            self.debugConnection:Disconnect()
+            self.debugConnection = nil
+        end
     end
 end
 
 function WorldRenderer:createDebugUI()
-    -- FPS counter
+    -- FPS counter (bottom center)
     self.fpsLabel = Instance.new("TextLabel")
     self.fpsLabel.Name = "FPSCounter"
     self.fpsLabel.Size = UDim2.new(0, 200, 0, 50)
-    self.fpsLabel.Position = UDim2.new(0, 10, 0, 10)
+    self.fpsLabel.Position = UDim2.new(0.5, 0, 1, -70) -- Center horizontally, 70px from bottom
+    self.fpsLabel.AnchorPoint = RobloxVector2.new(0.5, 1) -- Anchor from center-bottom
     self.fpsLabel.BackgroundTransparency = 0.3
     self.fpsLabel.BackgroundColor3 = Color3.new(0, 0, 0)
     self.fpsLabel.TextColor3 = Color3.new(0, 1, 0)
@@ -585,11 +680,12 @@ function WorldRenderer:createDebugUI()
     self.fpsLabel.Text = "FPS: 0"
     self.fpsLabel.Parent = self.debugContainer
 
-    -- Entity count
+    -- Entity count (above FPS counter)
     local entityCountLabel = Instance.new("TextLabel")
     entityCountLabel.Name = "EntityCount"
     entityCountLabel.Size = UDim2.new(0, 200, 0, 50)
-    entityCountLabel.Position = UDim2.new(0, 10, 0, 70)
+    entityCountLabel.Position = UDim2.new(0.5, 0, 1, -130) -- Center horizontally, 130px from bottom
+    entityCountLabel.AnchorPoint = RobloxVector2.new(0.5, 1) -- Anchor from center-bottom
     entityCountLabel.BackgroundTransparency = 0.3
     entityCountLabel.BackgroundColor3 = Color3.new(0, 0, 0)
     entityCountLabel.TextColor3 = Color3.new(0, 1, 0)
@@ -602,7 +698,8 @@ function WorldRenderer:createDebugUI()
     local lastTime = tick()
     local frameCount = 0
 
-    RunService.Heartbeat:Connect(function()
+    -- MEMORY LEAK FIX: Store debug update connection for cleanup
+    self.debugConnection = RunService.Heartbeat:Connect(function()
         if not self.debugMode then
             return
         end
@@ -634,6 +731,17 @@ function WorldRenderer:createDebugUI()
 end
 
 function WorldRenderer:destroy()
+    -- MEMORY LEAK FIX: Disconnect all event connections
+    if self.resizeConnection then
+        self.resizeConnection:Disconnect()
+        self.resizeConnection = nil
+    end
+
+    if self.debugConnection then
+        self.debugConnection:Disconnect()
+        self.debugConnection = nil
+    end
+
     if self.viewportFrame then
         self.viewportFrame:Destroy()
     end

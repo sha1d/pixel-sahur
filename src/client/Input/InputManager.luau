@@ -96,6 +96,9 @@ function InputManager.new(config: InputConfig?)
     self.onInputChanged = {} :: {[string]: (state: boolean) -> ()}
     self.onDeviceChanged = nil :: ((device: string) -> ())?
 
+    -- MEMORY LEAK FIX: Store connections for cleanup
+    self.connections = {} :: {RBXScriptConnection}
+
     -- Initialize
     self:initialize()
 
@@ -110,22 +113,22 @@ function InputManager:initialize()
     self:detectDevice()
 
     -- Set up device change detection
-    UserInputService.LastInputTypeChanged:Connect(function(inputType)
+    table.insert(self.connections, UserInputService.LastInputTypeChanged:Connect(function(inputType)
         self:onInputTypeChanged(inputType)
-    end)
+    end))
 
     -- Set up gamepad connection detection
-    UserInputService.GamepadConnected:Connect(function(gamepad)
+    table.insert(self.connections, UserInputService.GamepadConnected:Connect(function(gamepad)
         self.gamepadConnected = true
         self.currentDevice = "Gamepad"
         self:onDeviceChange("Gamepad")
-    end)
+    end))
 
-    UserInputService.GamepadDisconnected:Connect(function(gamepad)
+    table.insert(self.connections, UserInputService.GamepadDisconnected:Connect(function(gamepad)
         self.gamepadConnected = false
         self.currentDevice = "Keyboard"
         self:onDeviceChange("Keyboard")
-    end)
+    end))
 
     -- Set up touch controls if on mobile
     if UserInputService.TouchEnabled and self.config.touchControlsEnabled then
@@ -347,9 +350,9 @@ function InputManager:createVirtualJoystick()
         end
     end
 
-    UserInputService.InputBegan:Connect(onTouchStart)
-    UserInputService.InputChanged:Connect(onTouchMove)
-    UserInputService.InputEnded:Connect(onTouchEnd)
+    table.insert(self.connections, UserInputService.InputBegan:Connect(onTouchStart))
+    table.insert(self.connections, UserInputService.InputChanged:Connect(onTouchMove))
+    table.insert(self.connections, UserInputService.InputEnded:Connect(onTouchEnd))
 end
 
 function InputManager:createTouchButton(action: string, position: UDim2, size: UDim2, label: string)
@@ -446,7 +449,7 @@ function InputManager:onDeviceChange(device: string)
 end
 
 function InputManager:startUpdateLoop()
-    RunService.Heartbeat:Connect(function(deltaTime)
+    table.insert(self.connections, RunService.Heartbeat:Connect(function(deltaTime)
         -- Update gamepad analog sticks
         if self.currentDevice == "Gamepad" then
             self:updateGamepadInput()
@@ -454,7 +457,7 @@ function InputManager:startUpdateLoop()
 
         -- Process input buffer
         self:processInputBuffer()
-    end)
+    end))
 end
 
 function InputManager:updateGamepadInput()
@@ -554,6 +557,12 @@ function InputManager:vibrate(duration: number?, intensity: number?)
 end
 
 function InputManager:destroy()
+    -- MEMORY LEAK FIX: Disconnect all event connections
+    for _, connection in ipairs(self.connections) do
+        connection:Disconnect()
+    end
+    self.connections = {}
+
     -- Unbind all actions
     for action, _ in pairs(self.bindings) do
         self:unbindAction(action)

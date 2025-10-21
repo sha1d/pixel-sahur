@@ -48,15 +48,15 @@ function CharacterController.new(entityId: string, config: CharacterConfig?)
 
     -- Configuration
     local defaultConfig = {
-        moveSpeed = 200,
-        runSpeed = 350,
+        moveSpeed = 120,  -- Reduced from 200 for more controlled movement
+        runSpeed = 200,   -- Reduced from 350
         jumpPower = 400,
         airControl = 0.3,
         gravity = 980,
         maxFallSpeed = 600,
         groundFriction = 10,
         airFriction = 0.5,
-        dashSpeed = 500,
+        dashSpeed = 400,  -- Reduced from 500
         dashDuration = 0.2,
         dashCooldown = 1,
         attackDuration = 0.3,
@@ -195,20 +195,18 @@ function CharacterController:registerDefaultActions()
         name = "attack",
         duration = self.config.attackDuration,
         cooldown = self.config.attackCooldown,
-        canMove = false,
+        canMove = true,  -- PERFORMANCE FIX: Allow movement during attack in top-down mode (prevents lag feel)
         canJump = true,
-        canCancel = false,
-        animation = "attack",
+        canCancel = true,  -- PERFORMANCE FIX: Allow canceling attack to prevent input lock
+        animation = nil,  -- PERFORMANCE FIX: No attack animation yet, prevents trying to play non-existent animation
         onStart = function(controller)
-            controller:setState("attacking")
+            -- PERFORMANCE FIX: Don't change state to "attacking" since we don't have that animation
+            -- This prevents animation system from trying to play non-existent animation
             -- Attack hitbox would be spawned here
+            print("Attack triggered - hitbox spawn not yet implemented")
         end,
         onEnd = function(controller)
-            if controller.isGrounded then
-                controller:setState("idle")
-            else
-                controller:setState("falling")
-            end
+            -- No state change needed since we don't modify state in onStart
         end,
     })
 end
