@@ -306,13 +306,13 @@ function HitboxSystem:calculatePenetration(boundsA: Rectangle, boundsB: Rectangl
     -- If dx < 0 (B is left of A), push A to the RIGHT (positive X)
     if overlapX < overlapY then
         return Vector2.new(
-            if dx > 0 then -overlapX else overlapX,  -- FIXED: reversed signs
+            (if dx > 0 then -overlapX else overlapX),  -- FIXED: reversed signs
             0
         )
     else
         return Vector2.new(
             0,
-            if dy > 0 then -overlapY else overlapY  -- FIXED: reversed signs
+            (if dy > 0 then -overlapY else overlapY)  -- FIXED: reversed signs
         )
     end
 end

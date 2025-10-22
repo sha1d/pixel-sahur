@@ -88,7 +88,7 @@ function AnimationController:registerAnimationsFromConfig(config: {
             spriteSheet = config.spriteSheet,
             frameSize = config.frameSize,
             frames = frames,
-            loop = if animData.loop ~= nil then animData.loop else true,
+            loop = (if animData.loop ~= nil then animData.loop else true),
             speed = animData.speed or 1,
             priority = animData.priority,
         })
@@ -378,7 +378,7 @@ function AnimationController.createAnimationsFromSheet(config: {
             spriteSheet = config.spriteSheet,
             frameSize = {x = config.frameWidth, y = config.frameHeight},
             frames = frames,
-            loop = if animConfig.loop ~= nil then animConfig.loop else true,
+            loop = (if animConfig.loop ~= nil then animConfig.loop else true),
             speed = animConfig.speed or 1,
             priority = nil,
         }

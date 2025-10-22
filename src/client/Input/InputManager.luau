@@ -71,6 +71,9 @@ function InputManager.new(config: InputConfig?)
         lookY = 0,
     }
 
+    -- Mouse position (screen space)
+    self.mousePosition = Vector2.new(0, 0)
+
     -- Input bindings
     self.bindings = {} :: {[string]: InputBinding}
     self.actionPriorities = {} :: {[string]: number}
@@ -535,6 +538,14 @@ end
 
 function InputManager:onAction(action: string, callback: (state: boolean) -> ())
     self.onInputChanged[action] = callback
+end
+
+function InputManager:getMousePosition(): Vector2Type
+    -- Get mouse position from UserInputService
+    local mousePos = UserInputService:GetMouseLocation()
+    -- Subtract GuiInset to get actual screen position
+    local guiInset = GuiService:GetGuiInset()
+    return Vector2.new(mousePos.X - guiInset.X, mousePos.Y - guiInset.Y)
 end
 
 function InputManager:vibrate(duration: number?, intensity: number?)

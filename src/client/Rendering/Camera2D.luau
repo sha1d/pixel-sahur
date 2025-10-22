@@ -202,7 +202,7 @@ function Camera2D:shake(intensity: number?, duration: number?, frequency: number
         intensity = intensity or 5,
         duration = duration or 0.5,
         frequency = frequency or 60,
-        fadeOut = if fadeOut ~= nil then fadeOut else true,
+        fadeOut = (if fadeOut ~= nil then fadeOut else true),
         elapsed = 0,
     }
 

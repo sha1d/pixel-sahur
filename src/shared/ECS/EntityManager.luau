@@ -407,7 +407,7 @@ function EntityManager:update(deltaTime: number)
             end
 
             if #entities > 0 then
-                local startTime = if self.debug then tick() else 0
+                local startTime = (if self.debug then tick() else 0)
 
                 system:update(self, entities, deltaTime)
 
@@ -433,7 +433,7 @@ function EntityManager:getDebugInfo(): string
     info = info .. "Systems Performance:\n"
 
     for systemName, perf in pairs(self.systemPerformance) do
-        local avgTime = if perf.calls > 0 then perf.time / perf.calls * 1000 else 0
+        local avgTime = (if perf.calls > 0 then perf.time / perf.calls * 1000 else 0)
         info = info .. string.format("  %s: %.2fms avg (%d calls)\n", systemName, avgTime, perf.calls)
     end
 

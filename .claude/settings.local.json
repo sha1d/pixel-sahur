@@ -4,7 +4,9 @@
       "Bash(aftman install)",
       "Bash(wally --version)",
       "Bash(wally install)",
-      "Bash(tree src -I Packages)"
+      "Bash(tree src -I Packages)",
+      "Bash(luau-lsp:*)",
+      "Bash(selene:*)"
     ],
     "deny": [],
     "ask": []

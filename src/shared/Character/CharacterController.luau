@@ -59,8 +59,8 @@ function CharacterController.new(entityId: string, config: CharacterConfig?)
         dashSpeed = 400,  -- Reduced from 500
         dashDuration = 0.2,
         dashCooldown = 1,
-        attackDuration = 0.3,
-        attackCooldown = 0.5,
+        attackDuration = 0.67,  -- 8 frames at 12 FPS = ~0.67s
+        attackCooldown = 0.2,  -- Short cooldown to allow rapid attacks
         health = 100,
         maxHealth = 100,
     }
@@ -111,6 +111,9 @@ function CharacterController.new(entityId: string, config: CharacterConfig?)
 
     -- Animation states
     self.animationOverride = nil :: string?
+    self.attackDirection = "right" :: "right" | "up" | "down" -- Store attack direction
+    self.mouseWorldPos = nil :: Vector2Type? -- Mouse position in world space
+    self.velocityBeforeAttack = nil :: Vector2Type? -- Store velocity before attack
 
     -- Callbacks
     self.onStateChange = nil :: ((oldState: CharacterState, newState: CharacterState) -> ())?
@@ -176,7 +179,7 @@ function CharacterController:registerDefaultActions()
         canCancel = false,
         animation = "dash",
         onStart = function(controller)
-            local dashDir = if controller.facingDirection == "right" then 1 else -1
+            local dashDir = (if controller.facingDirection == "right" then 1 else -1)
             controller.velocity = Vector2.new(
                 controller.config.dashSpeed * dashDir,
                 0
@@ -195,18 +198,73 @@ function CharacterController:registerDefaultActions()
         name = "attack",
         duration = self.config.attackDuration,
         cooldown = self.config.attackCooldown,
-        canMove = true,  -- PERFORMANCE FIX: Allow movement during attack in top-down mode (prevents lag feel)
-        canJump = true,
-        canCancel = true,  -- PERFORMANCE FIX: Allow canceling attack to prevent input lock
-        animation = nil,  -- PERFORMANCE FIX: No attack animation yet, prevents trying to play non-existent animation
+        canMove = false,  -- Disable movement during attack for consistent hitbox
+        canJump = false,
+        canCancel = false,  -- Don't allow canceling attack - must complete
+        animation = "attack",  -- Attack animation enabled
         onStart = function(controller)
-            -- PERFORMANCE FIX: Don't change state to "attacking" since we don't have that animation
-            -- This prevents animation system from trying to play non-existent animation
-            -- Attack hitbox would be spawned here
-            print("Attack triggered - hitbox spawn not yet implemented")
+            -- Store current velocity and slow down character
+            controller.velocityBeforeAttack = controller.velocity
+            controller.velocity = Vector2.multiply(controller.velocity, 0.3)  -- Reduce to 30% speed
+            -- Determine attack direction based on mouse position relative to character
+            if controller.mouseWorldPos then
+                -- Calculate direction from character to mouse
+                local dirX = controller.mouseWorldPos.x - controller.position.x
+                local dirY = controller.mouseWorldPos.y - controller.position.y
+
+                print("[ATTACK] Char pos:", controller.position.x, controller.position.y, "Mouse:", controller.mouseWorldPos.x, controller.mouseWorldPos.y, "Dir:", dirX, dirY)
+
+                -- Determine attack direction based on angle
+                if math.abs(dirX) > math.abs(dirY) then
+                    -- Horizontal attack
+                    controller.attackDirection = "right"
+                    -- Update facing direction
+                    controller.facingDirection = dirX > 0 and "right" or "left"
+                    print("[ATTACK] Horizontal:", controller.facingDirection)
+                else
+                    -- Vertical attack
+                    controller.attackDirection = dirY > 0 and "down" or "up"
+                    print("[ATTACK] Vertical:", controller.attackDirection)
+                end
+            else
+                -- Fallback: use velocity direction if no mouse position
+                local velocity = controller.velocity
+                local speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+
+                if speed > 5 then
+                    -- Use velocity to determine direction
+                    if math.abs(velocity.x) > math.abs(velocity.y) then
+                        controller.attackDirection = "right"
+                    else
+                        controller.attackDirection = velocity.y > 0 and "down" or "up"
+                    end
+                else
+                    -- Standing still, use facing direction for horizontal attack
+                    controller.attackDirection = "right"
+                end
+            end
+
+            -- Set state to attacking to trigger attack animation
+            controller:setState("attacking")
+            -- TODO: Spawn attack hitbox here
         end,
         onEnd = function(controller)
-            -- No state change needed since we don't modify state in onStart
+            -- Restore velocity after attack
+            if controller.velocityBeforeAttack then
+                controller.velocity = controller.velocityBeforeAttack
+                controller.velocityBeforeAttack = nil
+            end
+
+            -- Return to appropriate state based on movement
+            if controller.state == "attacking" then
+                -- Check current velocity (restored)
+                local speed = math.sqrt(controller.velocity.x * controller.velocity.x + controller.velocity.y * controller.velocity.y)
+                if speed > 5 then
+                    controller:setState("walking")
+                else
+                    controller:setState("idle")
+                end
+            end
         end,
     })
 end
@@ -264,6 +322,13 @@ function CharacterController:performAction(actionName: string): boolean
     self.currentAction = action
     self.actionTime = 0
     self.actionCooldowns[actionName] = action.cooldown
+
+    -- Clear this action from input buffer since we're executing it now
+    for i = #self.inputBuffer, 1, -1 do
+        if self.inputBuffer[i].action == actionName then
+            table.remove(self.inputBuffer, i)
+        end
+    end
 
     -- Update movement flags
     self.canMove = action.canMove
@@ -325,7 +390,10 @@ function CharacterController:setState(newState: CharacterState)
     end
 end
 
-function CharacterController:update(deltaTime: number, input: InputState)
+function CharacterController:update(deltaTime: number, input: InputState, mouseWorldPos: Vector2Type?)
+    -- Store mouse world position for attack direction
+    self.mouseWorldPos = mouseWorldPos
+
     -- Update state time
     self.stateTime = self.stateTime + deltaTime
 
@@ -426,7 +494,7 @@ function CharacterController:handleInput(input: InputState, deltaTime: number)
                 )
             else
                 -- Platformer movement: acceleration-based horizontal movement
-                local control = if self.isGrounded then 1 else self.config.airControl
+                local control = (if self.isGrounded then 1 else self.config.airControl)
                 self.velocity = Vector2.new(
                     self.velocity.x + moveX * moveSpeed * control * deltaTime,
                     self.velocity.y
@@ -488,7 +556,7 @@ function CharacterController:updatePhysics(deltaTime: number)
     end
 
     -- Apply friction
-    local friction = if self.isGrounded then self.config.groundFriction else self.config.airFriction
+    local friction = (if self.isGrounded then self.config.groundFriction else self.config.airFriction)
     self.velocity = Vector2.new(
         self.velocity.x * (1 - friction * deltaTime),
         self.velocity.y
@@ -610,6 +678,11 @@ end
 function CharacterController:bufferInput(action: string)
     local currentTime = tick()
 
+    -- Don't buffer attack actions if an attack is already in progress
+    if action == "attack" and self.currentAction and self.currentAction.name == "attack" then
+        return
+    end
+
     -- Check if this action was just buffered recently (within 50ms)
     -- This prevents spam from held inputs
     for _, bufferedInput in ipairs(self.inputBuffer) do
@@ -652,5 +725,7 @@ function CharacterController:getAnimationState(): string
     -- Return animation override or current state
     return self.animationOverride or self.state
 end
+
+export type CharacterController = typeof(CharacterController.new("", nil))
 
 return CharacterController

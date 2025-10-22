@@ -1,11 +1,9 @@
 --!strict
--- Server-side networking module
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
--- Use SimplePackets instead of ByteNet for compatibility
 local Packets = require(game.ReplicatedStorage.Shared.Network.SimplePackets)
 local Types = require(game.ReplicatedStorage.Shared.Types)
 
@@ -20,7 +18,6 @@ NetworkServer.__index = NetworkServer
 function NetworkServer.new()
     local self = setmetatable({}, NetworkServer)
 
-    -- Player management
     self.players = {} :: {[Player]: {
         playerId: string,
         entityId: string?,
@@ -31,21 +28,17 @@ function NetworkServer.new()
         velocity: Vector2,
     }}
 
-    -- Entity management
     self.entities = {} :: {[string]: Entity}
     self.dirtyEntities = {} :: {[string]: boolean}
 
-    -- Network settings
-    self.tickRate = 20 -- 20Hz server tick rate
-    self.sendRate = 20 -- 20Hz update rate to clients (increased for better sync)
-    self.maxPlayerTimeout = 30 -- Disconnect after 30 seconds of inactivity
+    self.tickRate = 30 -- 30Hz server tick rate (increased from 20Hz for smoother movement)
+    self.sendRate = 30 -- 30Hz update rate to clients (increased from 20Hz for smoother movement)
+    self.maxPlayerTimeout = 30 
 
-    -- State
     self.running = false
     self.sequence = 0
     self.lastSendTime = 0
 
-    -- Callbacks
     self.onPlayerJoined = nil :: ((player: Player) -> ())?
     self.onPlayerLeft = nil :: ((player: Player) -> ())?
     self.onPlayerInput = nil :: ((player: Player, input: InputState, deltaTime: number) -> ())?
@@ -61,13 +54,10 @@ function NetworkServer:start()
 
     self.running = true
 
-    -- Set up player connections
     self:setupPlayerConnections()
 
-    -- Set up packet handlers
     self:setupPacketHandlers()
 
-    -- Start update loops
     self:startUpdateLoop()
     self:startSendLoop()
 
@@ -87,7 +77,6 @@ function NetworkServer:stop()
         self.sendLoop = nil
     end
 
-    -- Disconnect all players
     for player, _ in pairs(self.players) do
         self:removePlayer(player)
     end
@@ -96,17 +85,14 @@ function NetworkServer:stop()
 end
 
 function NetworkServer:setupPlayerConnections()
-    -- Handle new players
     Players.PlayerAdded:Connect(function(player)
         self:addPlayer(player)
     end)
 
-    -- Handle players leaving
     Players.PlayerRemoving:Connect(function(player)
         self:removePlayer(player)
     end)
 
-    -- Add any players already in the game
     for _, player in ipairs(Players:GetPlayers()) do
         self:addPlayer(player)
     end
@@ -138,11 +124,9 @@ function NetworkServer:removePlayer(player: Player)
         return
     end
 
-    -- Despawn player entity
     if playerData.entityId then
         self:despawnEntity(playerData.entityId)
 
-        -- Notify all other players
         Packets.PlayerLeft.sendToAll({
             playerId = playerData.playerId,
             entityId = playerData.entityId,
@@ -191,7 +175,6 @@ function NetworkServer:setupPacketHandlers()
         end
     end
 
-    -- Player action
     Packets.PlayerAction.onServerEvent = function(data, player)
         local playerData = self.players[player]
         if not playerData then
@@ -205,19 +188,16 @@ function NetworkServer:setupPacketHandlers()
         end
     end
 
-    -- Request spawn
     Packets.RequestSpawn.onServerEvent = function(data, player)
         self:spawnPlayerEntity(player, data.characterType, data.position)
     end
 
-    -- Chat messages
     Packets.Chat.onServerEvent = function(data, player)
         local playerData = self.players[player]
         if not playerData then
             return
         end
 
-        -- Broadcast chat to all players
         Packets.Chat.sendToAll({
             playerId = playerData.playerId,
             message = data.message,
@@ -241,26 +221,21 @@ function NetworkServer:spawnPlayerEntity(player: Player, characterType: string, 
         return
     end
 
-    -- Generate entity ID
     local entityId = "player_" .. playerData.playerId
 
-    -- If player already has an entity, despawn it first
     if playerData.entityId then
         self:despawnEntity(playerData.entityId)
     end
 
-    -- Create entity
     local entity: Entity = {
         id = entityId,
         components = {},
         active = true,
     }
 
-    -- Add to entities
     self.entities[entityId] = entity
     playerData.entityId = entityId
 
-    -- Convert Vector2 position to network format (table with x,y)
     local positionTable = {
         x = position.x,
         y = position.y
@@ -284,7 +259,6 @@ function NetworkServer:spawnPlayerEntity(player: Player, characterType: string, 
         end
     end
 
-    -- Send player joined notification to all players
     Packets.PlayerJoined.sendToAll({
         playerId = playerData.playerId,
         entityId = entityId,
@@ -292,7 +266,6 @@ function NetworkServer:spawnPlayerEntity(player: Player, characterType: string, 
         characterData = characterType,
     })
 
-    -- Send current world state to the new player (includes their own entity)
     self:sendWorldState(player)
 
     print("Spawned player entity:", player.Name, entityId)
@@ -309,14 +282,13 @@ function NetworkServer:spawnEntity(entityType: string, position: Vector2, data: 
 
     self.entities[entityId] = entity
 
-    -- Send spawn packet to all players
     Packets.EntitySpawn.sendToAll({
         entityId = entityId,
         entityType = entityType,
         position = position,
         velocity = {x = 0, y = 0},
         playerId = nil,
-        data = if data then HttpService:JSONEncode(data) else nil,
+        data = (if data then HttpService:JSONEncode(data) else nil),
     })
 
     return entityId
@@ -331,7 +303,6 @@ function NetworkServer:despawnEntity(entityId: string, reason: string?)
     self.entities[entityId] = nil
     self.dirtyEntities[entityId] = nil
 
-    -- Send despawn packet to all players
     Packets.EntityDespawn.sendToAll({
         entityId = entityId,
         reason = reason,
@@ -344,13 +315,10 @@ function NetworkServer:updateEntity(entityId: string, update: EntityUpdate)
         return
     end
 
-    -- Mark entity as dirty for next update
     self.dirtyEntities[entityId] = true
 
-    -- Update player data if this is a player entity
     for player, playerData in pairs(self.players) do
         if playerData.entityId == entityId then
-            -- Update position and velocity for replication
             if update.position then
                 playerData.position = update.position
             end
@@ -368,7 +336,6 @@ function NetworkServer:sendWorldState(player: Player)
     for entityId, entity in pairs(self.entities) do
         local playerData = nil
 
-        -- Find if this entity belongs to a player
         for _, pData in pairs(self.players) do
             if pData.entityId == entityId then
                 playerData = pData
@@ -378,11 +345,11 @@ function NetworkServer:sendWorldState(player: Player)
 
         table.insert(worldEntities, {
             entityId = entityId,
-            entityType = if playerData then "player" else "entity",
-            position = if playerData then playerData.position else {x = 0, y = 0},
-            velocity = if playerData then playerData.velocity else {x = 0, y = 0},
+            entityType = (if playerData then "player" else "entity"),
+            position = (if playerData then playerData.position else {x = 0, y = 0}),
+            velocity = (if playerData then playerData.velocity else {x = 0, y = 0}),
             state = "idle",
-            playerId = if playerData then playerData.playerId else nil,
+            playerId = (if playerData then playerData.playerId else nil),
         })
     end
 
@@ -401,7 +368,6 @@ function NetworkServer:startUpdateLoop()
             return
         end
 
-        -- Check for timed out players
         local currentTime = tick()
         for player, playerData in pairs(self.players) do
             if currentTime - playerData.lastActivity > self.maxPlayerTimeout then
@@ -430,14 +396,12 @@ function NetworkServer:startSendLoop()
 
         self.lastSendTime = currentTime
 
-        -- Collect all dirty entity updates with owner information
         local updates = {}
         local entityOwners = {} -- Map entityId -> owner Player
 
         for entityId, _ in pairs(self.dirtyEntities) do
             local entity = self.entities[entityId]
             if entity then
-                -- Find player data if this is a player entity
                 local ownerPlayer = nil
                 local playerData = nil
                 for player, pData in pairs(self.players) do
@@ -453,10 +417,10 @@ function NetworkServer:startSendLoop()
                         entityId = entityId,
                         position = playerData.position,
                         velocity = playerData.velocity,
-                        state = "idle", -- This would come from actual state
+                        state = "idle", 
                     }
                     table.insert(updates, updateData)
-                    entityOwners[entityId] = ownerPlayer -- Track owner
+                    entityOwners[entityId] = ownerPlayer 
                 end
             end
         end

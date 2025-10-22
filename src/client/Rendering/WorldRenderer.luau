@@ -37,6 +37,7 @@ export type RenderConfig = {
     antiAliasing: boolean,
     pixelPerfect: boolean,
     backgroundColor: Color3,
+    adaptiveZoom: boolean?, -- Enable screen-size based zoom adjustment
 }
 
 function WorldRenderer.new(screenGui: ScreenGui, config: RenderConfig?)
@@ -52,8 +53,14 @@ function WorldRenderer.new(screenGui: ScreenGui, config: RenderConfig?)
         antiAliasing = false,
         pixelPerfect = true,
         backgroundColor = Color3.new(0.1, 0.1, 0.2),
+        adaptiveZoom = false, -- Disabled by default to not interfere with existing scaling
     }
     self.config = config or defaultConfig
+
+    -- Ensure adaptiveZoom is set even if using partial config
+    if self.config.adaptiveZoom == nil then
+        self.config.adaptiveZoom = false
+    end
 
     -- Viewport
     self.viewport = Rectangle.new(0, 0, 1920, 1080)
@@ -84,6 +91,9 @@ function WorldRenderer.new(screenGui: ScreenGui, config: RenderConfig?)
         smoothing = 0.1,
         bounds = nil,
     } :: Camera
+
+    -- Base zoom for user-controlled zoom (before screen-size adaptation)
+    self.baseZoom = 1.0
 
     -- Performance
     self.visibleEntities = {} :: {[string]: boolean}
@@ -220,6 +230,52 @@ function WorldRenderer:scheduleViewportUpdate()
     end
 end
 
+function WorldRenderer:calculateScreenSizeZoom(screenSize: Vector2Type)
+    -- Calculate zoom based on screen size
+    -- Smaller screens get much higher zoom to keep the character visible and playable
+
+    -- Define reference screen sizes for zoom calculation
+    local referenceWidth = 1920  -- Full HD width as reference
+    local minWidth = 320         -- Minimum expected screen width (very small mobile)
+    local maxWidth = 3840        -- 4K width
+
+    -- Calculate zoom factor based on screen width
+    -- Using width because it's typically the more limiting dimension for gameplay
+    local screenWidth = screenSize.x  -- Use lowercase .x for custom Vector2 type
+
+    -- Calculate zoom multiplier - aggressive scaling for small screens
+    local zoomMultiplier = 1.0
+
+    if screenWidth < referenceWidth then
+        -- For screens smaller than reference, aggressively increase zoom
+        -- Use a curve that gives much more zoom for very small screens
+        local normalizedWidth = (screenWidth - minWidth) / (referenceWidth - minWidth)
+        normalizedWidth = math.clamp(normalizedWidth, 0, 1)
+
+        -- Use a power curve for more dramatic zoom on small screens
+        -- This gives a smooth but aggressive curve
+        local curve = math.pow(1.0 - normalizedWidth, 1.2)
+
+        -- Map to zoom range [1.0 to 3.0] - up to 200% extra zoom for tiny screens
+        -- At 320px (very small): ~3.0x zoom
+        -- At 640px (mobile): ~2.2x zoom
+        -- At 960px (tablet): ~1.6x zoom
+        -- At 1280px (laptop): ~1.3x zoom
+        -- At 1920px (desktop): 1.0x zoom
+        zoomMultiplier = 1.0 + curve * 2.0  -- Up to 200% extra zoom
+    elseif screenWidth > referenceWidth then
+        -- For screens larger than reference, slightly decrease zoom for wider view
+        -- Map screen width range [referenceWidth, maxWidth] to zoom range [1.0, 0.9]
+        local normalizedWidth = (screenWidth - referenceWidth) / (maxWidth - referenceWidth)
+        normalizedWidth = math.clamp(normalizedWidth, 0, 1)
+
+        zoomMultiplier = 1.0 - normalizedWidth * 0.1  -- Min 0.9x zoom for 4K screens
+    end
+    -- else: exactly 1920 width gets exactly 1.0x multiplier (no change)
+
+    return zoomMultiplier
+end
+
 function WorldRenderer:updateViewportScale()
     local screenSize = self.screenGui.AbsoluteSize
     self.screenSize = Vector2.new(screenSize.X, screenSize.Y)
@@ -259,6 +315,22 @@ function WorldRenderer:updateViewportScale()
 
     -- Apply pixel scale
     self.scaleFactor = self.scaleFactor * self.config.pixelScale
+
+    -- Calculate and apply screen-size based zoom if enabled
+    if self.config.adaptiveZoom then
+        local adaptiveZoom = self:calculateScreenSizeZoom(self.screenSize)
+        -- Apply the adaptive zoom multiplier to the current zoom
+        self.camera.zoom = self.baseZoom * adaptiveZoom
+
+        -- Debug output (active for testing)
+        local zoomPercent = (adaptiveZoom - 1.0) * 100
+        local zoomSign = zoomPercent >= 0 and "+" or ""
+        print(string.format("[Adaptive Zoom] Width: %dpx | Zoom: %s%.0f%% (%.2fx) | Final: %.2fx",
+            math.floor(self.screenSize.x), zoomSign, zoomPercent, adaptiveZoom, self.camera.zoom))
+    else
+        -- Use base zoom without adaptation
+        self.camera.zoom = self.baseZoom
+    end
 
     -- Update camera viewport
     self.camera.viewport = self.viewport
@@ -348,12 +420,12 @@ function WorldRenderer:setupEntityAnimation(entityId: string, config: {
     local animController = AnimationController.new(renderer)
 
     -- Calculate frames per row
-    local cols = 5 -- Based on Character.luau config
+    local cols = 7 -- Based on Character.luau config
 
     -- Register animations
     for name, animConfig in pairs(config.animations) do
         local frames = {}
-        local frameDuration = if animConfig.frameRate then 1 / animConfig.frameRate else 0.1
+        local frameDuration = (if animConfig.frameRate then 1 / animConfig.frameRate else 0.1)
 
         -- Convert frame indices to grid positions
         for frameIdx = animConfig.startFrame, animConfig.endFrame do
@@ -374,7 +446,7 @@ function WorldRenderer:setupEntityAnimation(entityId: string, config: {
             spriteSheet = config.spriteSheet,
             frameSize = Vector2.new(config.frameWidth, config.frameHeight),
             frames = frames,
-            loop = if animConfig.loop ~= nil then animConfig.loop else true,
+            loop = (if animConfig.loop ~= nil then animConfig.loop else true),
             speed = 1,
         })
     end
@@ -397,7 +469,7 @@ function WorldRenderer:setEntityFlip(entityId: string, flipX: boolean, flipY: bo
 
     -- Store flip state as attributes so AnimationController can respect it
     renderer:SetAttribute("FlipX", flipX)
-    renderer:SetAttribute("FlipY", if flipY ~= nil then flipY else false)
+    renderer:SetAttribute("FlipY", (if flipY ~= nil then flipY else false))
 
     -- Get the animation controller for this entity
     local animController = self.entityAnimations[entityId]
@@ -542,7 +614,17 @@ function WorldRenderer:setCameraPosition(position: Vector2Type)
 end
 
 function WorldRenderer:setCameraZoom(zoom: number)
-    self.camera.zoom = math.clamp(zoom, 0.1, 10)
+    -- Store the base zoom (user-controlled zoom level)
+    self.baseZoom = math.clamp(zoom, 0.1, 10)
+
+    -- Recalculate the actual zoom with screen-size adaptation if enabled
+    if self.config.adaptiveZoom then
+        local adaptiveZoom = self:calculateScreenSizeZoom(self.screenSize)
+        self.camera.zoom = self.baseZoom * adaptiveZoom
+    else
+        self.camera.zoom = self.baseZoom
+    end
+
     self:updateAllEntityPositions()
     self:updateAllEntityScales()
 end
@@ -582,12 +664,18 @@ function WorldRenderer:updateAllEntityPositions()
 end
 
 function WorldRenderer:updateAllEntityScales()
+    -- Update entity scales based on zoom - use original world sizes, not current absolute sizes
     for entityId, renderer in pairs(self.entityRenderers) do
-        local currentSize = renderer.AbsoluteSize
-        local scaledWidth = math.max(1, math.abs(currentSize.X * self.camera.zoom))
-        local scaledHeight = math.max(1, math.abs(currentSize.Y * self.camera.zoom))
+        -- Get the original world size from attributes (set when entity was created)
+        local worldWidth = renderer:GetAttribute("WorldWidth")
+        local worldHeight = renderer:GetAttribute("WorldHeight")
 
-        renderer.Size = UDim2.fromOffset(scaledWidth, scaledHeight)
+        if worldWidth and worldHeight then
+            -- Apply both scale factor and zoom to the original world size
+            local scaledWidth = math.max(1, math.abs(worldWidth * self.scaleFactor * self.camera.zoom))
+            local scaledHeight = math.max(1, math.abs(worldHeight * self.scaleFactor * self.camera.zoom))
+            renderer.Size = UDim2.fromOffset(scaledWidth, scaledHeight)
+        end
     end
 end
 

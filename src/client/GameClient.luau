@@ -77,6 +77,7 @@ function GameClient:initialize()
         maintainAspectRatio = true,
         pixelPerfect = true,
         backgroundColor = Color3.new(0.1, 0.1, 0.2),
+        adaptiveZoom = true,  -- Enable adaptive zoom for smaller screens (fixed now)
     })
 
     self.camera = Camera2D.new(Vector2.new(1920, 1080), {
@@ -125,11 +126,11 @@ function GameClient:setupNetworkCallbacks()
             position = position,
             rotation = 0,
             scale = Vector2.one(),
-            zIndex = if isObstacle then 5 else 10,
+            zIndex = (if isObstacle then 5 else 10),
         })
 
         -- Determine visual properties based on entity type
-        local imageId = "rbxassetid://112564202907644"
+        local imageId = "rbxassetid://128490447315329"
         local size = Vector2.new(64, 64)
         local color = Color3.new(1, 1, 1)
 
@@ -195,14 +196,18 @@ function GameClient:setupNetworkCallbacks()
         -- Setup sprite sheet animation for player entities
         if data.playerId then
             self.worldRenderer:setupEntityAnimation(entityId, {
-                spriteSheet = "rbxassetid://112564202907644",
+                spriteSheet = "rbxassetid://128490447315329",
                 frameWidth = 64,
                 frameHeight = 64,
                 animations = {
                     idle = { startFrame = 0, endFrame = 4, frameRate = 8, loop = true },
-                    right = { startFrame = 5, endFrame = 8, frameRate = 12, loop = true },  -- Used for both left (flipped) and right
+                    right = { startFrame = 5, endFrame = 8, frameRate = 12, loop = true },
                     up = { startFrame = 13, endFrame = 16, frameRate = 12, loop = true },
                     down = { startFrame = 9, endFrame = 12, frameRate = 12, loop = true },
+                    -- Attack animations
+                    attack_right = { startFrame = 17, endFrame = 24, frameRate = 12, loop = false },
+                    attack_up = { startFrame = 33, endFrame = 40, frameRate = 12, loop = false },
+                    attack_down = { startFrame = 25, endFrame = 32, frameRate = 12, loop = false },
                 }
             })
 
@@ -252,8 +257,8 @@ function GameClient:setupNetworkCallbacks()
                 dashSpeed = 400,  -- Reduced from 500
                 dashDuration = 0.2,
                 dashCooldown = 1,
-                attackDuration = 0.3,
-                attackCooldown = 0.5,
+                attackDuration = 0.67,  -- Match animation length: 8 frames at 12 FPS
+                attackCooldown = 0.2,  -- Short cooldown to allow rapid attacks
                 health = 100,
                 maxHealth = 100,
             })
@@ -316,28 +321,39 @@ function GameClient:setupNetworkCallbacks()
         -- Update entity components
         local transform = self.entityManager:getComponent(entityId, "Transform")
         if transform and update.position then
-            -- Convert network position to Vector2
-            local newPosition = Vector2.new(update.position.x, update.position.y)
-            transform.position = newPosition
+            -- For remote players, DO NOT immediately apply position!
+            -- NetworkClient will handle interpolation between updates.
+            -- We only update the transform for local player or if it's a significant teleport
 
-            -- Update visual position immediately for non-local players
-            if entityId ~= self.localEntityId and self.worldRenderer then
-                self.worldRenderer:updateEntityPosition(entityId, newPosition)
+            if entityId == self.localEntityId then
+                -- Local player is fully client-authoritative - ignore server position updates
+                -- Server only relays our position to other players, doesn't send corrections back
+                -- (This prevents jitter and teleporting from delayed server corrections)
+            else
+                -- For remote players, let the interpolation system handle smooth movement
+                -- We'll update their position in the update loop using interpolation
 
-                -- Also update character controller for animations
+                -- Only update character controller velocity for animation purposes
                 local charController = self.characterControllers[entityId]
-                if charController then
-                    charController.position = newPosition
-                    if update.velocity then
-                        charController.velocity = Vector2.new(update.velocity.x, update.velocity.y)
+                if charController and update.velocity then
+                    charController.velocity = Vector2.new(update.velocity.x, update.velocity.y)
+                end
+
+                -- Check for teleportation (position change > 500 units indicates teleport/respawn)
+                local newPosition = Vector2.new(update.position.x, update.position.y)
+                local distance = Vector2.distance(transform.position, newPosition)
+                if distance > 500 then
+                    -- This is a teleport, apply immediately
+                    transform.position = newPosition
+                    if self.worldRenderer then
+                        self.worldRenderer:updateEntityPosition(entityId, newPosition)
+                    end
+                    if charController then
+                        charController.position = newPosition
                     end
                 end
             end
         end
-
-        -- Local player is fully client-authoritative - ignore server position updates
-        -- Server only relays our position to other players, doesn't send corrections back
-        -- (This prevents jitter and teleporting from delayed server corrections)
 
         if update.state then
             local character = self.entityManager:getComponent(entityId, "Character")
@@ -476,12 +492,40 @@ function GameClient:registerSystems()
                         inputState = self.inputManager.inputState
                     end
 
+                    -- Get mouse position in world coordinates
+                    local mouseWorldPos = nil
+                    if self.inputManager and self.camera and self.worldRenderer then
+                        local mouseScreenPos = self.inputManager:getMousePosition()
+                        -- Convert screen position to world position using camera
+                        local cameraPos = self.camera:getPosition()
+                        local zoom = self.camera.zoom
+
+                        -- Get actual pixel scale from world renderer
+                        local pixelScale = self.worldRenderer.config.pixelScale
+
+                        -- Get the world container to account for any scaling/positioning
+                        local worldContainer = self.worldRenderer.worldContainer
+                        if worldContainer then
+                            -- Convert screen position to viewport-relative position
+                            local viewportPos = Vector2.new(
+                                mouseScreenPos.x - worldContainer.AbsolutePosition.X,
+                                mouseScreenPos.y - worldContainer.AbsolutePosition.Y
+                            )
+
+                            -- Convert to world coordinates
+                            mouseWorldPos = Vector2.new(
+                                (viewportPos.x - worldContainer.AbsoluteSize.X/2) / (pixelScale * zoom) + cameraPos.x,
+                                (viewportPos.y - worldContainer.AbsoluteSize.Y/2) / (pixelScale * zoom) + cameraPos.y
+                            )
+                        end
+                    end
+
                     -- Track blocked directions from collisions
                     local blockedX = false
                     local blockedY = false
 
-                    -- Update character controller with input
-                    charController:update(deltaTime, inputState)
+                    -- Update character controller with input and mouse position
+                    charController:update(deltaTime, inputState, mouseWorldPos)
 
                     -- Sync transform with character controller for local player
                     transform.position = charController.position
@@ -535,9 +579,8 @@ function GameClient:registerSystems()
                     -- NOW send validated position to server (after collision resolution)
                     self:sendInputToServer(inputState)
                 else
-                    -- For remote players, sync character controller position with server transform
-                    -- This ensures the character controller's internal state matches server position
-                    -- Transform position is already a Vector2, so we can assign it directly
+                    -- For remote players, position is already being smoothed by RemotePlayerSmoothingSystem
+                    -- Just keep CharacterController in sync with transform
                     charController.position = transform.position
                 end
 
@@ -576,42 +619,78 @@ function GameClient:registerSystems()
                     continue
                 end
 
-                -- Determine which animation to play based on velocity
                 local targetAnimation = "idle"
                 local shouldFlip = false
-                local velocity = charController.velocity
-                local speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
 
-                -- Use a higher threshold (5 px/s) to prevent animation flickering when barely moving
-                if speed > 5 then
-                    -- Character is moving - determine direction based on velocity
-                    if math.abs(velocity.x) > math.abs(velocity.y) then
-                        -- Horizontal movement dominant
-                        -- Use "right" animation for both left and right
-                        targetAnimation = "right"
+                -- Check if character is attacking (highest priority)
+                if charController.state == "attacking" then
+                    -- Use stored attack direction to determine animation
+                    local attackDir = charController.attackDirection
 
-                        -- Flip sprite when moving left
-                        if velocity.x < 0 then
+                    if attackDir == "right" then
+                        targetAnimation = "attack_right"
+                        -- Flip sprite when facing left
+                        if charController.facingDirection == "left" then
                             shouldFlip = true
                         end
-                    else
-                        -- Vertical movement dominant
-                        if velocity.y > 0 then
-                            targetAnimation = "down"
+                    elseif attackDir == "up" then
+                        targetAnimation = "attack_up"
+                    else -- "down"
+                        targetAnimation = "attack_down"
+                    end
+
+                    -- Apply sprite flip
+                    if self.worldRenderer then
+                        self.worldRenderer:setEntityFlip(entity.id, shouldFlip)
+                    end
+
+                    -- Play attack animation ONCE - don't restart if already playing
+                    local currentAnim = animController:getCurrentAnimation()
+                    if not currentAnim or not currentAnim:find("attack") then
+                        animController:play(targetAnimation)
+                    end
+                else
+                    -- Normal movement animations
+                    local velocity = charController.velocity
+                    local speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+
+                    -- Use a higher threshold (5 px/s) to prevent animation flickering when barely moving
+                    if speed > 5 then
+                        -- Character is moving - determine direction based on velocity
+                        if math.abs(velocity.x) > math.abs(velocity.y) then
+                            -- Horizontal movement dominant
+                            -- Use "right" animation for both left and right
+                            targetAnimation = "right"
+
+                            -- Flip sprite when moving left
+                            if velocity.x < 0 then
+                                shouldFlip = true
+                            end
                         else
-                            targetAnimation = "up"
+                            -- Vertical movement dominant
+                            if velocity.y > 0 then
+                                targetAnimation = "down"
+                            else
+                                targetAnimation = "up"
+                            end
                         end
                     end
-                end
 
-                -- Apply sprite flip for horizontal movement
-                if self.worldRenderer then
-                    self.worldRenderer:setEntityFlip(entity.id, shouldFlip)
-                end
+                    -- Apply sprite flip for horizontal movement
+                    if self.worldRenderer then
+                        self.worldRenderer:setEntityFlip(entity.id, shouldFlip)
+                    end
 
-                -- Play animation if different from current
-                if not animController:isPlaying(targetAnimation) then
-                    animController:play(targetAnimation)
+                    -- Force play animation when transitioning from attack or when animation is not playing
+                    local currentAnim = animController:getCurrentAnimation()
+                    local isAttackAnim = currentAnim and currentAnim:find("attack")
+
+                    -- Play animation if:
+                    -- 1. Current animation is an attack animation (force transition)
+                    -- 2. Target animation is not currently playing
+                    if isAttackAnim or not animController:isPlaying(targetAnimation) then
+                        animController:play(targetAnimation)
+                    end
                 end
             end
         end,
@@ -654,6 +733,61 @@ function GameClient:registerSystems()
         end,
     }
 
+    -- Remote Player Smoothing system (runs before CharacterController)
+    local RemotePlayerSmoothingSystem = {
+        name = "RemotePlayerSmoothing",
+        priority = 0, -- Run before CharacterController
+        requiredComponents = {"Transform", "Character"},
+        enabled = true,
+        update = function(system, entityManager, entities, deltaTime)
+            for _, entity in ipairs(entities) do
+                -- Only smooth remote players, not local player
+                if entity.id ~= self.localEntityId then
+                    local transform = entity.components.Transform
+                    local charController = self.characterControllers[entity.id]
+
+                    if charController then
+                        -- Get interpolated position from NetworkClient
+                        local targetPos = self.networkClient:getInterpolatedPosition(entity.id)
+                        if targetPos then
+                            -- Convert to Vector2
+                            local targetPosition = Vector2.new(targetPos.x, targetPos.y)
+
+                            -- Apply exponential smoothing for extra smoothness
+                            -- This creates a "rubber band" effect that smoothly pulls the player to target
+                            local smoothingFactor = 12 -- Higher = snappier, Lower = smoother
+                            local t = 1 - math.exp(-smoothingFactor * deltaTime)
+
+                            -- Smooth both position and character controller
+                            local currentPos = transform.position
+                            local smoothedPos = Vector2.lerp(currentPos, targetPosition, t)
+
+                            -- Update positions
+                            transform.position = smoothedPos
+                            charController.position = smoothedPos
+
+                            -- Calculate smoothed velocity for animations
+                            if not entity.lastSmoothPosition then
+                                entity.lastSmoothPosition = smoothedPos
+                            end
+                            local smoothVelocity = Vector2.divide(
+                                Vector2.subtract(smoothedPos, entity.lastSmoothPosition),
+                                math.max(deltaTime, 0.001) -- Prevent divide by zero
+                            )
+                            entity.lastSmoothPosition = smoothedPos
+
+                            -- Update velocity for animation purposes (if not already set from network)
+                            if Vector2.length(charController.velocity) < 1 then
+                                charController.velocity = smoothVelocity
+                            end
+                        end
+                    end
+                end
+            end
+        end,
+    }
+
+    self.entityManager:registerSystem(RemotePlayerSmoothingSystem)
     self.entityManager:registerSystem(CharacterControllerSystem)
     self.entityManager:registerSystem(AnimationSystem)
     self.entityManager:registerSystem(StaticObjectRenderingSystem)
@@ -709,11 +843,8 @@ function GameClient:update(deltaTime: number)
     -- Get input state
     local inputState = self.inputManager.inputState
 
-    -- Update local character
+    -- Send input to server (character controller is updated in CharacterControllerSystem)
     if self.localCharacter then
-        self.localCharacter:update(deltaTime, inputState)
-
-        -- Send input to server
         local hasInput = inputState.moveLeft or inputState.moveRight or inputState.moveUp or inputState.moveDown
         if hasInput and tick() % 2 < deltaTime then -- Print every ~2 seconds when moving
             print("[CLIENT] Sending input - LocalChar exists:", self.localCharacter ~= nil, "Connected:", self.networkClient.connected)

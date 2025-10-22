@@ -17,6 +17,11 @@ local Packets = require(ReplicatedStorage.Shared.Network.SimplePackets)
 type Entity = Types.Entity
 type Vector2Type = Types.Vector2
 type InputState = Types.InputState
+type CharacterControllerType = CharacterController.CharacterController
+type CollisionInfo = HitboxSystem.CollisionInfo
+type System = EntityManager.System
+type Transform = Types.Transform
+type Hitbox = Types.Hitbox
 
 local GameServer = {}
 GameServer.__index = GameServer
@@ -30,9 +35,9 @@ function GameServer.new()
     self.hitboxSystem = HitboxSystem.new()
 
     -- Player management
-    self.playerCharacters = {} :: {[Player]: any} -- CharacterController instances
+    self.playerCharacters = {} :: {[Player]: CharacterControllerType}
     self.playerEntities = {} :: {[Player]: string}
-    self.playerLastInput = {} :: {[Player]: InputState} -- Store last input for each player
+    self.playerLastInput = {} :: {[Player]: InputState}
 
     -- Static entities (obstacles, walls, etc.) to send to joining players
     self.staticEntities = {} :: {{entityId: string, position: Vector2Type, entityType: string, size: Vector2Type}}
@@ -41,6 +46,10 @@ function GameServer.new()
     self.running = false
     self.tickRate = 30 -- 30Hz server tick
     self.lastTick = 0
+
+    -- Connections
+    self.gameLoop = nil :: RBXScriptConnection?
+    self.physicsLoop = nil :: RBXScriptConnection?
 
     -- World configuration
     self.worldBounds = {
@@ -115,7 +124,7 @@ function GameServer:setupNetworkCallbacks()
     end
 
     -- Player action
-    self.networkServer.onPlayerAction = function(player: Player, action: string, data: any)
+    self.networkServer.onPlayerAction = function(player: Player, action: string, data: any?)
         print("Player action:", player.Name, action)
 
         local character = self.playerCharacters[player]
@@ -161,7 +170,7 @@ function GameServer:setupHitboxCallbacks()
     end
 end
 
-function GameServer:resolveCollision(entityA: any, entityB: any, collision: any)
+function GameServer:resolveCollision(entityA: Entity, entityB: Entity, collision: CollisionInfo)
     -- Determine which entity should be pushed (dynamic vs static)
     local transformA = entityA.components.Transform
     local transformB = entityB.components.Transform
@@ -255,7 +264,7 @@ end
 
 function GameServer:registerSystems()
     -- CharacterController system - processes player movement
-    local CharacterControllerSystem = {
+    local CharacterControllerSystem: System = {
         name = "CharacterController",
         priority = 1,
         requiredComponents = {"Transform", "Character"},
@@ -280,7 +289,7 @@ function GameServer:registerSystems()
                         character:update(deltaTime, inputState)
 
                         -- Update entity transform with character position
-                        local transform = entity.components.Transform
+                        local transform = entity.components.Transform :: Transform
                         if transform then
                             transform.position = character.position
 
@@ -303,7 +312,7 @@ function GameServer:registerSystems()
                         end
 
                         -- Update character component state
-                        local charComponent = entity.components.Character
+                        local charComponent = entity.components.Character :: Types.Character
                         if charComponent then
                             charComponent.state = character.state
                             charComponent.health = character.health
@@ -316,18 +325,18 @@ function GameServer:registerSystems()
     }
 
     -- Physics system
-    local PhysicsSystem = {
+    local PhysicsSystem: System = {
         name = "Physics",
         priority = 2,
         requiredComponents = {"Transform", "Physics"},
         enabled = true,
         update = function(system, entityManager, entities, deltaTime)
             for _, entity in ipairs(entities) do
-                local transform = entity.components.Transform
-                local physics = entity.components.Physics
+                local transform = entity.components.Transform :: Transform
+                local physics = entity.components.Physics :: Types.Physics
 
                 -- Apply gravity
-                if not physics.isStatic then
+                if physics and transform and not physics.isStatic then
                     physics.velocity = Vector2.new(
                         physics.velocity.x,
                         physics.velocity.y + 980 * deltaTime -- Gravity
@@ -345,7 +354,7 @@ function GameServer:registerSystems()
 
                 -- Update hitbox position if entity has one
                 local hitbox = entity.components.Hitbox
-                if hitbox then
+                if hitbox and transform then
                     self.hitboxSystem:updateHitbox(entity.id, transform)
                 end
             end
@@ -353,14 +362,14 @@ function GameServer:registerSystems()
     }
 
     -- AI System (for NPCs/Enemies)
-    local AISystem = {
+    local AISystem: System = {
         name = "AI",
         priority = 3,
         requiredComponents = {"Transform", "AI"},
         enabled = true,
         update = function(system, entityManager, entities, deltaTime)
             for _, entity in ipairs(entities) do
-                local ai = entity.components.AI
+                local ai = entity.components.AI :: Types.AI
                 -- Basic AI logic would go here
                 -- For example: pathfinding, state machines, etc.
             end
@@ -416,8 +425,8 @@ function GameServer:createWorldBoundary(name: string, position: Vector2Type, siz
     })
 
     -- Register hitbox
-    local transform = self.entityManager:getComponent(entityId, "Transform")
-    local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(entityId, "Hitbox") :: Hitbox?
     if transform and hitbox then
         self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
     end
@@ -521,8 +530,8 @@ function GameServer:createStaticBox(name: string, position: Vector2Type, size: V
     })
 
     -- Register hitbox
-    local transform = self.entityManager:getComponent(entityId, "Transform")
-    local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(entityId, "Hitbox") :: Hitbox?
     if transform and hitbox then
         self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
     end
@@ -589,8 +598,8 @@ function GameServer:createStaticWall(name: string, position: Vector2Type, size: 
     })
 
     -- Register hitbox
-    local transform = self.entityManager:getComponent(entityId, "Transform")
-    local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(entityId, "Hitbox") :: Hitbox?
     if transform and hitbox then
         self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
     end
@@ -665,8 +674,8 @@ function GameServer:spawnPlayer(player: Player)
     })
 
     -- Register hitbox
-    local transform = self.entityManager:getComponent(entityId, "Transform")
-    local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(entityId, "Hitbox") :: Hitbox?
     if transform and hitbox then
         self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
     end
@@ -751,7 +760,7 @@ function GameServer:despawnPlayer(player: Player)
     print("Despawned player entity:", entityId)
 end
 
-function GameServer:spawnEnemy(enemyType: string, position: Vector2Type)
+function GameServer:spawnEnemy(enemyType: string, position: Vector2Type): string
     local entityId = self.networkServer:spawnEntity("enemy", position, {type = enemyType})
     local entity = self.entityManager:createEntity(entityId)
 
@@ -797,8 +806,8 @@ function GameServer:spawnEnemy(enemyType: string, position: Vector2Type)
     })
 
     -- Register hitbox
-    local transform = self.entityManager:getComponent(entityId, "Transform")
-    local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(entityId, "Hitbox") :: Hitbox?
     if transform and hitbox then
         self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
     end
@@ -806,7 +815,7 @@ function GameServer:spawnEnemy(enemyType: string, position: Vector2Type)
     return entityId
 end
 
-function GameServer:handlePlayerAttack(player: Player, data: any)
+function GameServer:handlePlayerAttack(player: Player, data: any?)
     local character = self.playerCharacters[player]
     local entityId = self.playerEntities[player]
     if not character or not entityId then
@@ -817,15 +826,15 @@ function GameServer:handlePlayerAttack(player: Player, data: any)
     local attackId = entityId .. "_attack_" .. tick()
     local attackEntity = self.entityManager:createEntity(attackId)
 
-    local transform = self.entityManager:getComponent(entityId, "Transform")
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
     if not transform then
         return
     end
 
     -- Position attack hitbox in front of player
-    local attackOffset = if character.facingDirection == "right"
+    local attackOffset = (if character.facingDirection == "right"
         then Vector2.new(30, 0)
-        else Vector2.new(-30, 0)
+        else Vector2.new(-30, 0))
     local attackPos = Vector2.add(transform.position, attackOffset)
 
     self.entityManager:addComponent(attackId, "Transform", {
@@ -838,7 +847,7 @@ function GameServer:handlePlayerAttack(player: Player, data: any)
     self.entityManager:addComponent(attackId, "AttackHitbox", {
         owner = entityId,
         damage = 25,
-        knockback = Vector2.new(if character.facingDirection == "right" then 200 else -200, -100),
+        knockback = Vector2.new((if character.facingDirection == "right" then 200 else -200), -100),
         lifetime = 0.1,
     })
 
@@ -852,8 +861,8 @@ function GameServer:handlePlayerAttack(player: Player, data: any)
     })
 
     -- Register hitbox
-    local attackTransform = self.entityManager:getComponent(attackId, "Transform")
-    local attackHitbox = self.entityManager:getComponent(attackId, "Hitbox")
+    local attackTransform = self.entityManager:getComponent(attackId, "Transform") :: Transform?
+    local attackHitbox = self.entityManager:getComponent(attackId, "Hitbox") :: Hitbox?
     if attackTransform and attackHitbox then
         self.hitboxSystem:registerHitbox(attackId, attackHitbox, attackTransform)
     end
@@ -864,12 +873,12 @@ function GameServer:handlePlayerAttack(player: Player, data: any)
     self.entityManager:destroyEntity(attackId)
 end
 
-function GameServer:handlePlayerInteract(player: Player, data: any)
+function GameServer:handlePlayerInteract(player: Player, data: any?)
     -- Handle interaction with world objects
     print("Player interact:", player.Name)
 end
 
-function GameServer:handlePlayerEnemyCollision(player: Entity, enemy: Entity, collision: any)
+function GameServer:handlePlayerEnemyCollision(player: Entity, enemy: Entity, collision: CollisionInfo)
     -- Damage player on contact with enemy
     local playerChar = player.components.Character
     local enemyData = enemy.components.Enemy
@@ -891,7 +900,7 @@ function GameServer:handlePlayerEnemyCollision(player: Entity, enemy: Entity, co
     end
 end
 
-function GameServer:handleAttackHit(attackEntity: Entity, targetEntity: Entity, collision: any)
+function GameServer:handleAttackHit(attackEntity: Entity, targetEntity: Entity, collision: CollisionInfo)
     local attack = attackEntity.components.AttackHitbox
     if not attack then
         return
@@ -1001,7 +1010,7 @@ function GameServer:stop()
     end
 end
 
-function GameServer:update(_: number)
+function GameServer:update(_deltaTime: number)
     -- Server tick rate limiting
     local currentTime = tick()
     local tickInterval = 1 / self.tickRate
@@ -1034,7 +1043,7 @@ function GameServer:update(_: number)
                 end
 
                 -- Sync to transform
-                local transform = self.entityManager:getComponent(entityId, "Transform")
+                local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
                 if transform then
                     transform.position = character.position
 
@@ -1061,7 +1070,7 @@ function GameServer:update(_: number)
 
         local entityId = self.playerEntities[player]
         if entityId then
-            local transform = self.entityManager:getComponent(entityId, "Transform")
+            local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
             if transform then
                 transform.position = character.position
                 self.networkServer:updateEntity(entityId, {
@@ -1096,5 +1105,7 @@ function GameServer:destroy()
     self.playerCharacters = {}
     self.playerEntities = {}
 end
+
+export type GameServer = typeof(GameServer.new())
 
 return GameServer

@@ -9,14 +9,13 @@ export type ComponentType = string
 
 export type Entity = {
     id: EntityId,
-    components: {[ComponentType]: Component},
+    components: {[ComponentType]: any}, -- Components can be any specific component type
     active: boolean,
 }
 
 export type Component = {
     type: ComponentType,
     entity: EntityId?,
-    [string]: any,
 }
 
 export type Transform = Component & {
@@ -91,6 +90,28 @@ export type Character = Component & {
     isGrounded: boolean,
     canMove: boolean,
     canJump: boolean,
+}
+
+export type Enemy = Component & {
+    type: string,
+    health: number,
+    maxHealth: number,
+    damage: number,
+    moveSpeed: number,
+    aggroRange: number,
+}
+
+export type AttackHitbox = Component & {
+    owner: string,
+    damage: number,
+    knockback: Vector2,
+    lifetime: number,
+}
+
+export type AI = Component & {
+    behavior: string,
+    target: string?,
+    patrolPoints: {Vector2},
 }
 
 export type InputAction = "moveLeft" | "moveRight" | "moveUp" | "moveDown" | "jump" | "attack" | "interact" | "dash"

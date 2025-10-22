@@ -290,13 +290,32 @@ function NetworkClient:getInterpolatedPosition(entityId: string): Vector2?
     -- Calculate interpolation factor
     local currentTime = tick()
     local timeSinceUpdate = currentTime - state.lastUpdate
-    local interpolationTime = math.min(timeSinceUpdate / self.interpolationDelay, 1)
 
-    -- Lerp between previous and current position
-    return {
-        x = state.previous.position.x + (state.current.position.x - state.previous.position.x) * interpolationTime,
-        y = state.previous.position.y + (state.current.position.y - state.previous.position.y) * interpolationTime,
+    -- Use a shorter interpolation window (33ms) for more responsive movement
+    -- Server sends at 30Hz (33ms), so we interpolate over that period
+    local interpolationWindow = 0.033 -- 33ms to match server send rate
+    local interpolationFactor = math.min(timeSinceUpdate / interpolationWindow, 1)
+
+    -- Use smooth step interpolation for more natural movement
+    -- smoothstep(t) = t * t * (3 - 2 * t)
+    local smoothFactor = interpolationFactor * interpolationFactor * (3 - 2 * interpolationFactor)
+
+    -- Lerp between previous and current position with smoothstep
+    local lerpedPosition = {
+        x = state.previous.position.x + (state.current.position.x - state.previous.position.x) * smoothFactor,
+        y = state.previous.position.y + (state.current.position.y - state.previous.position.y) * smoothFactor,
     }
+
+    -- If we have velocity, add extrapolation for even smoother movement
+    if state.current.velocity and interpolationFactor >= 0.8 then
+        -- Extrapolate slightly beyond current position using velocity
+        -- This helps bridge the gap between updates
+        local extrapolationTime = math.min((timeSinceUpdate - interpolationWindow) * 0.5, 0.025) -- Max 25ms extrapolation
+        lerpedPosition.x = lerpedPosition.x + state.current.velocity.x * extrapolationTime
+        lerpedPosition.y = lerpedPosition.y + state.current.velocity.y * extrapolationTime
+    end
+
+    return lerpedPosition
 end
 
 function NetworkClient:getServerTime(): number
