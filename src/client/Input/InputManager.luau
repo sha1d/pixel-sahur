@@ -152,8 +152,9 @@ function InputManager:setupDefaultBindings()
     -- Actions
     self:bindAction("jump", {Enum.KeyCode.Space}, Enum.KeyCode.ButtonA)
     self:bindAction("attack", {Enum.UserInputType.MouseButton1, Enum.KeyCode.J}, Enum.KeyCode.ButtonX)
+    self:bindAction("skill", {Enum.KeyCode.X}, Enum.KeyCode.ButtonY)
     self:bindAction("dash", {Enum.KeyCode.LeftShift}, Enum.KeyCode.ButtonB)
-    self:bindAction("interact", {Enum.KeyCode.E}, Enum.KeyCode.ButtonY)
+    self:bindAction("interact", {Enum.KeyCode.E}, Enum.KeyCode.ButtonL1)
 
     -- Menu
     self:bindAction("pause", {Enum.KeyCode.Escape}, Enum.KeyCode.ButtonStart)

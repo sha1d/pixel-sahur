@@ -37,6 +37,8 @@ function AnimationController.new(imageLabel: ImageLabel)
     local self = setmetatable({}, AnimationController)
 
     self.imageLabel = imageLabel
+    self.originalWorldWidth = nil :: number?  -- Store original world dimensions
+    self.originalWorldHeight = nil :: number?
     self.animations = {} :: {[string]: AnimationData}
     self.currentState = nil :: AnimationState?
     self.queuedAnimation = nil :: string?
@@ -130,6 +132,26 @@ function AnimationController:play(animationName: string, forceRestart: boolean?,
 
     -- Set sprite sheet
     self.imageLabel.Image = animation.spriteSheet
+
+    -- Update WorldWidth/WorldHeight attributes for animations with different frame sizes
+    -- This ensures WorldRenderer's update loop uses the correct size
+    local currentWorldWidth = self.imageLabel:GetAttribute("WorldWidth") or 64
+    local currentWorldHeight = self.imageLabel:GetAttribute("WorldHeight") or 64
+
+    -- Scale world size based on frame size difference (base size is 64x64)
+    local baseSize = 64
+    local scaleFactorX = animation.frameSize.x / baseSize
+    local scaleFactorY = animation.frameSize.y / baseSize
+
+    -- Store original world size if not already stored
+    if not self.originalWorldWidth then
+        self.originalWorldWidth = currentWorldWidth
+        self.originalWorldHeight = currentWorldHeight
+    end
+
+    -- Update attributes to maintain visual size
+    self.imageLabel:SetAttribute("WorldWidth", self.originalWorldWidth * scaleFactorX)
+    self.imageLabel:SetAttribute("WorldHeight", self.originalWorldHeight * scaleFactorY)
 
     -- Update frame immediately
     self:updateFrame()
@@ -301,6 +323,12 @@ function AnimationController:update(deltaTime: number)
 end
 
 function AnimationController:destroy()
+    -- Restore original world size before destroying
+    if self.originalWorldWidth and self.originalWorldHeight then
+        self.imageLabel:SetAttribute("WorldWidth", self.originalWorldWidth)
+        self.imageLabel:SetAttribute("WorldHeight", self.originalWorldHeight)
+    end
+
     if self.connection then
         self.connection:Disconnect()
         self.connection = nil

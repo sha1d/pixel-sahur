@@ -77,7 +77,7 @@ export type Physics = Component & {
     isStatic: boolean,
 }
 
-export type CharacterState = "idle" | "walking" | "running" | "jumping" | "falling" | "attacking" | "hurt" | "dead"
+export type CharacterState = "idle" | "walking" | "running" | "jumping" | "falling" | "attacking" | "skill" | "hurt" | "dead"
 
 export type Character = Component & {
     playerId: string,

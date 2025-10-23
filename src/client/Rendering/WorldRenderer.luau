@@ -398,6 +398,10 @@ function WorldRenderer:setupEntityAnimation(entityId: string, config: {
         endFrame: number,
         frameRate: number?,
         loop: boolean?,
+        spriteSheet: string?,  -- Optional per-animation sprite sheet
+        frameWidth: number?,  -- Optional per-animation frame width
+        frameHeight: number?,  -- Optional per-animation frame height
+        columns: number?,  -- Optional columns per row for this sprite sheet
     }}
 })
     local renderer = self.entityRenderers[entityId]
@@ -420,12 +424,17 @@ function WorldRenderer:setupEntityAnimation(entityId: string, config: {
     local animController = AnimationController.new(renderer)
 
     -- Calculate frames per row
-    local cols = 7 -- Based on Character.luau config
+    local defaultCols = 7 -- Based on Character.luau config
 
     -- Register animations
     for name, animConfig in pairs(config.animations) do
         local frames = {}
         local frameDuration = (if animConfig.frameRate then 1 / animConfig.frameRate else 0.1)
+
+        -- Use per-animation frame dimensions if provided
+        local frameWidth = animConfig.frameWidth or config.frameWidth
+        local frameHeight = animConfig.frameHeight or config.frameHeight
+        local cols = animConfig.columns or defaultCols  -- Use per-animation column count
 
         -- Convert frame indices to grid positions
         for frameIdx = animConfig.startFrame, animConfig.endFrame do
@@ -433,18 +442,18 @@ function WorldRenderer:setupEntityAnimation(entityId: string, config: {
             local row = math.floor(frameIdx / cols)
 
             table.insert(frames, {
-                x = col * config.frameWidth,
-                y = row * config.frameHeight,
-                width = config.frameWidth,
-                height = config.frameHeight,
+                x = col * frameWidth,
+                y = row * frameHeight,
+                width = frameWidth,
+                height = frameHeight,
                 duration = frameDuration,
             })
         end
 
         animController:registerAnimation({
             name = name,
-            spriteSheet = config.spriteSheet,
-            frameSize = Vector2.new(config.frameWidth, config.frameHeight),
+            spriteSheet = animConfig.spriteSheet or config.spriteSheet,  -- Use per-animation sprite sheet if defined
+            frameSize = Vector2.new(frameWidth, frameHeight),  -- Use per-animation frame size
             frames = frames,
             loop = (if animConfig.loop ~= nil then animConfig.loop else true),
             speed = 1,

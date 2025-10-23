@@ -208,15 +208,20 @@ function GameClient:setupNetworkCallbacks()
                     attack_right = { startFrame = 17, endFrame = 24, frameRate = 12, loop = false },
                     attack_up = { startFrame = 33, endFrame = 40, frameRate = 12, loop = false },
                     attack_down = { startFrame = 25, endFrame = 32, frameRate = 12, loop = false },
+                    -- Skill animation (using new sprite sheet with 128x128 frames, 8 columns layout)
+                    skill = { startFrame = 0, endFrame = 12, frameRate = 15, loop = false, spriteSheet = "rbxassetid://111630265859486", frameWidth = 128, frameHeight = 128, columns = 7 },
+                    skill_effect = { startFrame = 13, endFrame = 20, frameRate = 15, loop = false, spriteSheet = "rbxassetid://111630265859486", frameWidth = 128, frameHeight = 128, columns = 7 },
                 }
             })
-
+            
             -- Start with idle animation
             local animController = self.worldRenderer:getEntityAnimation(entityId)
             if animController then
                 animController:play("idle")
             end
         end
+
+        -- Skill animations configured with sprite sheet rbxassetid://111630265859486
 
         -- If this is a player entity
         if data.playerId then
@@ -403,6 +408,12 @@ function GameClient:setupInputCallbacks()
     self.inputManager:onAction("attack", function(pressed)
         if pressed and self.localCharacter then
             self.localCharacter:performAction("attack")
+        end
+    end)
+
+    self.inputManager:onAction("skill", function(pressed)
+        if pressed and self.localCharacter then
+            self.localCharacter:performAction("skill")
         end
     end)
 
@@ -622,8 +633,79 @@ function GameClient:registerSystems()
                 local targetAnimation = "idle"
                 local shouldFlip = false
 
-                -- Check if character is attacking (highest priority)
-                if charController.state == "attacking" then
+                -- Check if character is using skill (highest priority)
+                if charController.state == "skill" then
+                    targetAnimation = "skill"
+
+                    -- Flip sprite based on facing direction
+                    if charController.facingDirection == "left" then
+                        shouldFlip = true
+                    end
+
+                    -- Apply sprite flip
+                    if self.worldRenderer then
+                        self.worldRenderer:setEntityFlip(entity.id, shouldFlip)
+                    end
+
+                    -- Play skill animation ONCE - don't restart if already playing
+                    local currentAnim = animController:getCurrentAnimation()
+                    if currentAnim ~= "skill" then
+                        animController:play(targetAnimation)
+                    end
+
+                    -- Check if we need to spawn the effect
+                    if charController.skillEffectTriggered and not charController.skillEffectSpawned then
+                        charController.skillEffectSpawned = true
+                        -- Create a temporary effect entity at the player's position
+                        local effectId = "skill_effect_" .. tostring(entity.id) .. "_" .. tostring(tick())
+
+                        -- Position the effect at the same position as the player
+                        local effectPosition = charController.skillEffectPosition or charController.position
+
+                        -- Create renderer for the effect at 64x64 (will be scaled 2x to 128x128 by AnimationController due to 128x128 frames)
+                        local renderer = self.worldRenderer:createEntityRenderer(effectId, "rbxassetid://111630265859486", Vector2.new(64, 64))
+
+                        -- Set the position immediately
+                        if renderer then
+                            self.worldRenderer:updateEntityPosition(effectId, effectPosition)
+                            -- Make sure it's visible
+                            renderer.Visible = true
+                            renderer.ZIndex = 100  -- Put it on top
+                        end
+
+                        -- Setup the effect animation with 128x128 frames and 7 columns
+                        self.worldRenderer:setupEntityAnimation(effectId, {
+                            spriteSheet = "rbxassetid://111630265859486",
+                            frameWidth = 128,
+                            frameHeight = 128,
+                            animations = {
+                                -- Effect frames 13-20 (8 frames) at 10 FPS with 7 columns
+                                effect = { startFrame = 13, endFrame = 20, frameRate = 10, loop = false, columns = 7 },
+                            }
+                        })
+
+                        -- Apply flip if character is facing left
+                        if charController.facingDirection == "left" then
+                            self.worldRenderer:setEntityFlip(effectId, true)
+                        end
+
+                        -- Play the effect animation
+                        local effectAnimController = self.worldRenderer:getEntityAnimation(effectId)
+                        if effectAnimController then
+                            effectAnimController:play("effect")
+
+                            -- Schedule cleanup after animation completes (0.8 seconds for 8 frames at 10 FPS)
+                            task.spawn(function()
+                                task.wait(0.8)
+                                if self.worldRenderer then
+                                    self.worldRenderer:removeEntityRenderer(effectId)
+                                end
+                                -- Don't reset skillEffectSpawned here - let CharacterController handle it when skill ends
+                            end)
+                        end
+                    end
+                -- Check if character is attacking (second priority)
+                elseif charController.state == "attacking" then
                     -- Use stored attack direction to determine animation
                     local attackDir = charController.attackDirection
 

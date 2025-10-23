@@ -131,6 +131,8 @@ function GameServer:setupNetworkCallbacks()
         if character then
             if action == "attack" then
                 self:handlePlayerAttack(player, data)
+            elseif action == "skill" then
+                self:handlePlayerSkill(player, data)
             elseif action == "interact" then
                 self:handlePlayerInteract(player, data)
             end
@@ -140,6 +142,11 @@ end
 
 function GameServer:setupHitboxCallbacks()
     -- Collision detection
+    -- Layer System:
+    -- Layer 1: Players - collide with enemies and walls only (NOT with other players)
+    -- Layer 2: Enemies - collide with players and walls
+    -- Layer 3: Player attacks - collide with enemies
+    -- Layer 6: Walls/Obstacles - collide with everything
     self.hitboxSystem.onCollisionEnter = function(collision)
         -- Handle different collision types
         local entityA = self.entityManager:getEntity(collision.entityA)
@@ -147,6 +154,11 @@ function GameServer:setupHitboxCallbacks()
 
         if not entityA or not entityB then
             return
+        end
+
+        -- Skip player vs player collisions entirely
+        if self:isPlayer(entityA) and self:isPlayer(entityB) then
+            return -- Players don't collide with each other
         end
 
         -- Resolve solid (non-trigger) collisions
@@ -669,7 +681,7 @@ function GameServer:spawnPlayer(player: Player)
         offset = Vector2.zero(),
         isTrigger = false,
         layer = 1, -- Player layer
-        mask = bit32.bor(bit32.lshift(1, 2), bit32.lshift(1, 6)), -- Collides with enemies and walls
+        mask = bit32.bor(bit32.lshift(1, 2), bit32.lshift(1, 6)), -- Collides ONLY with enemies (layer 2) and walls (layer 6), NOT with other players (layer 1)
         debugDraw = false,
     })
 
@@ -871,6 +883,71 @@ function GameServer:handlePlayerAttack(player: Player, data: any?)
     task.wait(0.1)
     self.hitboxSystem:unregisterHitbox(attackId)
     self.entityManager:destroyEntity(attackId)
+end
+
+function GameServer:handlePlayerSkill(player: Player, data: any?)
+    local character = self.playerCharacters[player]
+    local entityId = self.playerEntities[player]
+    if not character or not entityId then
+        return
+    end
+
+    -- Create skill hitbox (larger than normal attack)
+    local skillId = entityId .. "_skill_" .. tick()
+    local skillEntity = self.entityManager:createEntity(skillId)
+
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    if not transform then
+        return
+    end
+
+    -- Position skill hitbox in front of player (further reach than normal attack)
+    local skillOffset = (if character.facingDirection == "right"
+        then Vector2.new(40, 0)
+        else Vector2.new(-40, 0))
+    local skillPos = Vector2.add(transform.position, skillOffset)
+
+    self.entityManager:addComponent(skillId, "Transform", {
+        position = skillPos,
+        rotation = 0,
+        scale = Vector2.one(),
+        zIndex = 15,
+    })
+
+    self.entityManager:addComponent(skillId, "AttackHitbox", {
+        owner = entityId,
+        damage = 50,  -- Double the damage of normal attack
+        knockback = Vector2.new((if character.facingDirection == "right" then 400 else -400), -150),  -- Stronger knockback
+        lifetime = 0.3,  -- Lasts longer than normal attack
+    })
+
+    self.entityManager:addComponent(skillId, "Hitbox", {
+        size = Vector2.new(80, 60),  -- Larger hitbox than normal attack
+        offset = Vector2.zero(),
+        isTrigger = true,
+        layer = 3, -- Player attack layer
+        mask = bit32.lshift(1, 2), -- Only hits enemies
+        debugDraw = false,
+    })
+
+    -- Register hitbox
+    local skillTransform = self.entityManager:getComponent(skillId, "Transform") :: Transform?
+    local skillHitbox = self.entityManager:getComponent(skillId, "Hitbox") :: Hitbox?
+    if skillTransform and skillHitbox then
+        self.hitboxSystem:registerHitbox(skillId, skillHitbox, skillTransform)
+    end
+
+    -- Broadcast skill effect to all clients for visual feedback
+    self.networkServer:broadcast("skillEffect", {
+        entityId = entityId,
+        position = transform.position,
+        direction = character.facingDirection,
+    })
+
+    -- Schedule hitbox removal (lasts longer than normal attack)
+    task.wait(0.3)
+    self.hitboxSystem:unregisterHitbox(skillId)
+    self.entityManager:destroyEntity(skillId)
 end
 
 function GameServer:handlePlayerInteract(player: Player, data: any?)

@@ -28,6 +28,71 @@ export type CharacterConfig = {
     maxHealth: number,
 }
 
+-- Define the controller instance type structure
+export type CharacterControllerInstance = {
+    entityId: string,
+    config: CharacterConfig,
+    state: CharacterState,
+    previousState: CharacterState,
+    stateTime: number,
+    position: Vector2Type,
+    velocity: Vector2Type,
+    acceleration: Vector2Type,
+    facingDirection: "left" | "right",
+    isGrounded: boolean,
+    jumpCount: number,
+    maxJumps: number,
+    health: number,
+    maxHealth: number,
+    isDead: boolean,
+    invulnerable: boolean,
+    invulnerabilityTime: number,
+    canMove: boolean,
+    canJump: boolean,
+    canAttack: boolean,
+    canDash: boolean,
+    currentAction: CharacterAction?,
+    actionTime: number,
+    actionCooldowns: {[string]: number},
+    registeredActions: {[string]: CharacterAction},
+    inputBuffer: {action: string, timestamp: number},
+    inputBufferTime: number,
+    previousInput: {
+        jump: boolean,
+        attack: boolean,
+        dash: boolean,
+        interact: boolean,
+    },
+    animationOverride: string?,
+    attackDirection: "right" | "up" | "down",
+    mouseWorldPos: Vector2Type?,
+    velocityBeforeAttack: Vector2Type?,
+    onStateChange: ((oldState: CharacterState, newState: CharacterState) -> ())?,
+    onActionStart: ((action: CharacterAction) -> ())?,
+    onActionEnd: ((action: CharacterAction) -> ())?,
+    onDamage: ((damage: number, source: string?) -> ())?,
+    onDeath: (() -> ())?,
+    onGroundHit: (() -> ())?,
+    onWallHit: ((normal: Vector2Type) -> ())?,
+    setState: (self: CharacterControllerInstance, newState: CharacterState) -> (),
+    registerAction: (self: CharacterControllerInstance, action: CharacterAction) -> (),
+    performAction: (self: CharacterControllerInstance, actionName: string) -> boolean,
+    endCurrentAction: (self: CharacterControllerInstance) -> (),
+    update: (self: CharacterControllerInstance, deltaTime: number, input: InputState, mouseWorldPos: Vector2Type?) -> (),
+    handleInput: (self: CharacterControllerInstance, input: InputState, deltaTime: number) -> (),
+    updatePhysics: (self: CharacterControllerInstance, deltaTime: number) -> (),
+    updateState: (self: CharacterControllerInstance) -> (),
+    setGrounded: (self: CharacterControllerInstance, grounded: boolean) -> (),
+    takeDamage: (self: CharacterControllerInstance, damage: number, source: string?, knockback: Vector2Type?) -> (),
+    heal: (self: CharacterControllerInstance, amount: number) -> (),
+    die: (self: CharacterControllerInstance) -> (),
+    respawn: (self: CharacterControllerInstance, position: Vector2Type) -> (),
+    bufferInput: (self: CharacterControllerInstance, action: string) -> (),
+    processInputBuffer: (self: CharacterControllerInstance) -> (),
+    getAnimationState: (self: CharacterControllerInstance) -> string,
+    registerDefaultActions: (self: CharacterControllerInstance) -> (),
+}
+
 export type CharacterAction = {
     name: string,
     duration: number,
@@ -36,9 +101,9 @@ export type CharacterAction = {
     canJump: boolean,
     canCancel: boolean,
     animation: string,
-    onStart: ((self: CharacterController) -> ())?,
-    onUpdate: ((self: CharacterController, dt: number) -> ())?,
-    onEnd: ((self: CharacterController) -> ())?,
+    onStart: ((self: CharacterControllerInstance) -> ())?,
+    onUpdate: ((self: CharacterControllerInstance, dt: number) -> ())?,
+    onEnd: ((self: CharacterControllerInstance) -> ())?,
 }
 
 function CharacterController.new(entityId: string, config: CharacterConfig?)
@@ -76,7 +141,8 @@ function CharacterController.new(entityId: string, config: CharacterConfig?)
     self.velocity = Vector2.new(0, 0)
     self.acceleration = Vector2.new(0, 0)
     self.facingDirection = "right" :: "left" | "right"
-    self.isGrounded = self.config.gravity == 0 -- Always grounded in top-down mode
+    -- Always grounded in top-down mode
+    self.isGrounded = self.config.gravity == 0
     self.jumpCount = 0
     self.maxJumps = 2
 
@@ -212,19 +278,15 @@ function CharacterController:registerDefaultActions()
                 local dirX = controller.mouseWorldPos.x - controller.position.x
                 local dirY = controller.mouseWorldPos.y - controller.position.y
 
-                print("[ATTACK] Char pos:", controller.position.x, controller.position.y, "Mouse:", controller.mouseWorldPos.x, controller.mouseWorldPos.y, "Dir:", dirX, dirY)
-
                 -- Determine attack direction based on angle
                 if math.abs(dirX) > math.abs(dirY) then
                     -- Horizontal attack
                     controller.attackDirection = "right"
                     -- Update facing direction
                     controller.facingDirection = dirX > 0 and "right" or "left"
-                    print("[ATTACK] Horizontal:", controller.facingDirection)
                 else
                     -- Vertical attack
                     controller.attackDirection = dirY > 0 and "down" or "up"
-                    print("[ATTACK] Vertical:", controller.attackDirection)
                 end
             else
                 -- Fallback: use velocity direction if no mouse position
@@ -258,6 +320,69 @@ function CharacterController:registerDefaultActions()
             -- Return to appropriate state based on movement
             if controller.state == "attacking" then
                 -- Check current velocity (restored)
+                local speed = math.sqrt(controller.velocity.x * controller.velocity.x + controller.velocity.y * controller.velocity.y)
+                if speed > 5 then
+                    controller:setState("walking")
+                else
+                    controller:setState("idle")
+                end
+            end
+        end,
+    })
+
+    -- Skill action (X key)
+    self:registerAction({
+        name = "skill",
+        duration = 0.89,  -- Extended duration for more impactful skill
+        cooldown = 2.0,  -- 2 second cooldown between skills
+        canMove = false,  -- Disable movement during skill
+        canJump = false,
+        canCancel = false,  -- Must complete the skill animation
+        animation = "skill",
+        onStart = function(controller)
+            -- Store current velocity and slow down character more for skill
+            controller.velocityBeforeSkill = controller.velocity
+            controller.velocity = Vector2.multiply(controller.velocity, 0.15)  -- Reduce to 15% speed for dramatic effect
+
+            -- Determine skill direction based on mouse position
+            if controller.mouseWorldPos then
+                local dirX = controller.mouseWorldPos.x - controller.position.x
+
+                -- Update facing direction for skill
+                controller.facingDirection = dirX > 0 and "right" or "left"
+                controller.skillDirection = controller.facingDirection
+            else
+                -- Use current facing direction
+                controller.skillDirection = controller.facingDirection
+            end
+
+            -- Set state to skill to trigger skill animation
+            controller:setState("skill")
+
+            -- Store position for effect spawn
+            controller.skillEffectPosition = Vector2.new(controller.position.x, controller.position.y)
+        end,
+        onUpdate = function(controller, progress)
+            -- At 15% progress (around frame 1-2), trigger the effect very early
+            if progress >= 0.15 and not controller.skillEffectTriggered then
+                controller.skillEffectTriggered = true
+                -- This is where we'll trigger the effect animation (frames 8-13)
+            end
+        end,
+        onEnd = function(controller)
+            -- Restore velocity after skill
+            if controller.velocityBeforeSkill then
+                controller.velocity = controller.velocityBeforeSkill
+                controller.velocityBeforeSkill = nil
+            end
+
+            -- Reset effect trigger flags
+            controller.skillEffectTriggered = false
+            controller.skillEffectSpawned = false
+            controller.skillEffectPosition = nil
+
+            -- Return to appropriate state
+            if controller.state == "skill" then
                 local speed = math.sqrt(controller.velocity.x * controller.velocity.x + controller.velocity.y * controller.velocity.y)
                 if speed > 5 then
                     controller:setState("walking")
@@ -406,9 +531,10 @@ function CharacterController:update(deltaTime: number, input: InputState, mouseW
     if self.currentAction then
         self.actionTime = self.actionTime + deltaTime
 
-        -- Call action update
+        -- Call action update with progress (0 to 1)
         if self.currentAction.onUpdate then
-            self.currentAction.onUpdate(self, deltaTime)
+            local progress = math.min(1, self.actionTime / self.currentAction.duration)
+            self.currentAction.onUpdate(self, progress)
         end
 
         -- Check if action finished
@@ -536,7 +662,9 @@ function CharacterController:handleInput(input: InputState, deltaTime: number)
 
     -- Interact - trigger only on press, not hold
     if input.interact and not self.previousInput.interact then
-        -- Interact action would go here
+        -- TODO: Implement interact action
+        -- Placeholder to avoid empty block warning
+        local _ = true
     end
 
     -- Store current input for next frame
@@ -726,6 +854,6 @@ function CharacterController:getAnimationState(): string
     return self.animationOverride or self.state
 end
 
-export type CharacterController = typeof(CharacterController.new("", nil))
+export type CharacterController = CharacterControllerInstance
 
 return CharacterController

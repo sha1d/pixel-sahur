@@ -6,7 +6,8 @@
       "Bash(wally install)",
       "Bash(tree src -I Packages)",
       "Bash(luau-lsp:*)",
-      "Bash(selene:*)"
+      "Bash(selene:*)",
+      "Bash(dir:*)"
     ],
     "deny": [],
     "ask": []
