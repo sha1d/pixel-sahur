@@ -14,6 +14,10 @@ local Vector2 = require(ReplicatedStorage.Shared.Utils.Vector2)
 local Types = require(ReplicatedStorage.Shared.Types)
 local Packets = require(ReplicatedStorage.Shared.Network.SimplePackets)
 
+-- Enemy modules
+local Snake = require(ReplicatedStorage.Shared.Enemies.Snake)
+local SnakeAI = require(script.Parent.AI.SnakeAI)
+
 type Entity = Types.Entity
 type Vector2Type = Types.Vector2
 type InputState = Types.InputState
@@ -32,7 +36,11 @@ function GameServer.new()
     -- Core systems
     self.entityManager = EntityManager.new()
     self.networkServer = NetworkServer.new()
+    self.networkServer:setGameServer(self) -- Give NetworkServer access to this GameServer
     self.hitboxSystem = HitboxSystem.new()
+
+    -- AI handlers
+    self.snakeAI = SnakeAI.new(self.entityManager)
 
     -- Player management
     self.playerCharacters = {} :: {[Player]: CharacterControllerType}
@@ -111,9 +119,16 @@ function GameServer:setupNetworkCallbacks()
         -- Store the last input for this player
         self.playerLastInput[player] = input
 
-        local hasInput = input.moveLeft or input.moveRight or input.moveUp or input.moveDown
-        if hasInput and tick() % 2 < 0.033 then -- Print occasionally
-            print("[SERVER] Received input from", player.Name)
+        -- Debug: Print input state occasionally
+        if not self.lastInputDebug or (tick() - self.lastInputDebug) > 3 then
+            self.lastInputDebug = tick()
+            print("[SERVER INPUT]", player.Name, "L:", input.moveLeft, "R:", input.moveRight, "U:", input.moveUp, "D:", input.moveDown)
+
+            -- Also print character position
+            local character = self.playerCharacters[player]
+            if character then
+                print("[SERVER CHAR POS]", player.Name, "at", math.floor(character.position.x), math.floor(character.position.y), "Vel:", math.floor(character.velocity.x), math.floor(character.velocity.y))
+            end
         end
 
         -- Mark the player's entity as dirty so it gets updated
@@ -276,12 +291,14 @@ end
 
 function GameServer:registerSystems()
     -- CharacterController system - processes player movement
+    -- NOTE: DISABLED for players in client-authoritative mode
+    -- Client handles all movement/collision at 60fps, server just relays positions
     local CharacterControllerSystem: System = {
         name = "CharacterController",
         priority = 1,
         requiredComponents = {"Transform", "Character"},
         enabled = true,
-        update = function(system, entityManager, entities, deltaTime)
+        update = function(system, entityManager, entities, _deltaTime)
             for _, entity in ipairs(entities) do
                 -- Find the player that owns this entity
                 local ownerPlayer = nil
@@ -293,37 +310,13 @@ function GameServer:registerSystems()
                 end
 
                 if ownerPlayer then
+                    -- SKIP CharacterController update for players - client is authoritative!
+                    -- Position is already updated in GameServer:update() from client data
+                    -- We only need to sync the character component state here
+
                     local character = self.playerCharacters[ownerPlayer]
-                    local inputState = self.playerLastInput[ownerPlayer]
-
-                    if character and inputState then
-                        -- Update character controller with input
-                        character:update(deltaTime, inputState)
-
-                        -- Update entity transform with character position
-                        local transform = entity.components.Transform :: Transform
-                        if transform then
-                            transform.position = character.position
-
-                            -- Update network server's internal position tracking
-                            local playerData = self.networkServer.players[ownerPlayer]
-                            if playerData then
-                                -- Convert Vector2 to network format (table with x,y)
-                                playerData.position = {
-                                    x = character.position.x,
-                                    y = character.position.y
-                                }
-                                playerData.velocity = {
-                                    x = character.velocity.x,
-                                    y = character.velocity.y
-                                }
-
-                                -- Mark entity as dirty for network updates
-                                self.networkServer.dirtyEntities[entity.id] = true
-                            end
-                        end
-
-                        -- Update character component state
+                    if character then
+                        -- Just sync character component state (no position update!)
                         local charComponent = entity.components.Character :: Types.Character
                         if charComponent then
                             charComponent.state = character.state
@@ -337,6 +330,7 @@ function GameServer:registerSystems()
     }
 
     -- Physics system
+    -- NOTE: Players are EXCLUDED - they use client-authoritative movement
     local PhysicsSystem: System = {
         name = "Physics",
         priority = 2,
@@ -344,15 +338,32 @@ function GameServer:registerSystems()
         enabled = true,
         update = function(system, entityManager, entities, deltaTime)
             for _, entity in ipairs(entities) do
+                -- SKIP PLAYERS - they are client-authoritative!
+                -- Client handles all player physics/movement at 60fps
+                local isPlayer = entity.components.Character ~= nil
+                if isPlayer then
+                    continue  -- Skip to next entity
+                end
+
                 local transform = entity.components.Transform :: Transform
                 local physics = entity.components.Physics :: Types.Physics
 
-                -- Apply gravity
+                -- Apply gravity (skip for enemies - this is a top-down game)
                 if physics and transform and not physics.isStatic then
-                    physics.velocity = Vector2.new(
-                        physics.velocity.x,
-                        physics.velocity.y + 980 * deltaTime -- Gravity
-                    )
+                    -- Only apply gravity to non-enemy entities
+                    local hasEnemy = entity.components.Enemy ~= nil
+                    if not hasEnemy then
+                        physics.velocity = Vector2.new(
+                            physics.velocity.x,
+                            physics.velocity.y + 980 * deltaTime -- Gravity
+                        )
+                    else
+                        -- DEBUG: Verify gravity skip is working
+                        if not self.gravitySkipDebugShown then
+                            print("PhysicsSystem: Skipping gravity for enemy entity", entity.id:sub(1, 8))
+                            self.gravitySkipDebugShown = true
+                        end
+                    end
 
                     -- Apply velocity
                     transform.position = Vector2.add(
@@ -377,13 +388,47 @@ function GameServer:registerSystems()
     local AISystem: System = {
         name = "AI",
         priority = 3,
-        requiredComponents = {"Transform", "AI"},
+        requiredComponents = {"Transform", "AI", "Enemy"},
         enabled = true,
         update = function(system, entityManager, entities, deltaTime)
+            -- Debug: Print how many AI entities found (once per second)
+            if not self.aiSystemLastDebug or (tick() - self.aiSystemLastDebug) > 1 then
+                self.aiSystemLastDebug = tick()
+                print("AI System: Found", #entities, "entities with AI components")
+            end
+
             for _, entity in ipairs(entities) do
                 local ai = entity.components.AI :: Types.AI
-                -- Basic AI logic would go here
-                -- For example: pathfinding, state machines, etc.
+                local enemy = entity.components.Enemy :: Types.Enemy
+
+                -- Handle Snake AI
+                if enemy.type == "snake" then
+                    self.snakeAI:update(entity, deltaTime)
+
+                    -- Check if Snake wants to attack (using flag instead of cooldown check)
+                    if ai.wantsToAttack then
+                        print("🐍 Snake", entity.id:sub(1, 8), "ATTACKING! Creating attack hitbox...")
+                        ai.wantsToAttack = false  -- Clear flag after processing
+
+                        -- Find target player entity
+                        local targetEntity = self.entityManager:getEntity(ai.target)
+                        if targetEntity and targetEntity.components.Transform then
+                            local attackData = self.snakeAI:performAttack(entity, {
+                                id = ai.target,
+                                position = targetEntity.components.Transform.position
+                            })
+
+                            if attackData then
+                                -- Create attack hitbox entity
+                                local attackId = self:createEnemyAttack(entity.id, attackData)
+                                print("Created attack hitbox:", attackId, "at", math.floor(attackData.position.x), math.floor(attackData.position.y))
+                            end
+                        end
+                    end
+                else
+                    -- Basic AI logic for other enemy types
+                    -- For example: pathfinding, state machines, etc.
+                end
             end
         end,
     }
@@ -445,17 +490,30 @@ function GameServer:createWorldBoundary(name: string, position: Vector2Type, siz
 end
 
 function GameServer:spawnTestEntities()
-    -- Spawn test collision objects around the map
     self:spawnTestObjects()
 
-    -- Spawn some test enemies or items
-    for i = 1, 5 do
-        local position = Vector2.new(
-            math.random(-500, 500),
-            math.random(-500, 500)
-        )
-        self:spawnEnemy("test", position)
-    end
+    -- Spawn Snake enemies spread around the map
+    print("Spawning Snake enemies around spawn area...")
+
+    -- Spawn snakes in different directions, further apart
+    self:spawnSnakeEnemy(Vector2.new(300, 150))
+    print("Spawned Snake at (300, 150)")
+
+    self:spawnSnakeEnemy(Vector2.new(-250, 200))
+    print("Spawned Snake at (-250, 200)")
+
+    self:spawnSnakeEnemy(Vector2.new(200, -300))
+    print("Spawned Snake at (200, -300)")
+
+    self:spawnSnakeEnemy(Vector2.new(-200, -250))
+    print("Spawned Snake at (-200, -250)")
+
+    -- Spawn regular test enemies for comparison (these should work)
+    self:spawnEnemy("test", Vector2.new(100, 100))
+    print("Spawned test enemy at (100, 100)")
+
+    self:spawnEnemy("test", Vector2.new(-100, -100))
+    print("Spawned test enemy at (-100, -100)")
 end
 
 function GameServer:spawnTestObjects()
@@ -651,7 +709,7 @@ function GameServer:spawnPlayer(player: Player)
         position = spawnPos,
         rotation = 0,
         scale = Vector2.one(),
-        zIndex = 10,
+        zIndex = 20,  -- Players render on top of everything else
     })
 
     self.entityManager:addComponent(entityId, "Character", {
@@ -739,6 +797,7 @@ end
 function GameServer:sendStaticEntitiesToPlayer(player: Player)
     print("Sending", #self.staticEntities, "static entities to player", player.Name)
 
+    -- Send obstacles and walls
     for _, staticEntity in ipairs(self.staticEntities) do
         Packets.EntitySpawn.sendTo(player, {
             entityId = staticEntity.entityId,
@@ -750,6 +809,43 @@ function GameServer:sendStaticEntitiesToPlayer(player: Player)
             data = nil,
         })
     end
+
+    -- Send all existing enemy entities to the new player
+    local enemies = self.entityManager:queryComponents("Enemy")
+    local enemyCount = 0
+    for entityId, enemy in pairs(enemies) do
+        local entity = self.entityManager:getEntity(entityId)
+        if entity and entity.active then
+            local transform = entity.components.Transform
+            if transform then
+                enemyCount = enemyCount + 1
+
+                -- Reconstruct the enemy data to send
+                local enemyData = {
+                    type = enemy.type,
+                }
+
+                -- Add Snake-specific data if it's a snake
+                if enemy.type == "snake" then
+                    enemyData.spriteSheet = Snake.CONFIG.spriteSheet
+                    enemyData.frameSize = Snake.CONFIG.frameSize
+                    enemyData.columns = Snake.CONFIG.columns
+                    enemyData.animations = Snake.CONFIG.animations
+                end
+
+                Packets.EntitySpawn.sendTo(player, {
+                    entityId = entityId,
+                    position = transform.position,
+                    entityType = "enemy",
+                    velocity = Vector2.zero(),
+                    playerId = nil,
+                    data = game:GetService("HttpService"):JSONEncode(enemyData),
+                })
+            end
+        end
+    end
+
+    print("Sent", enemyCount, "enemy entities to player", player.Name)
 end
 
 function GameServer:despawnPlayer(player: Player)
@@ -781,7 +877,7 @@ function GameServer:spawnEnemy(enemyType: string, position: Vector2Type): string
         position = position,
         rotation = 0,
         scale = Vector2.one(),
-        zIndex = 5,
+        zIndex = 8,  -- Enemies render below players (20) but above obstacles (5)
     })
 
     self.entityManager:addComponent(entityId, "Enemy", {
@@ -825,6 +921,103 @@ function GameServer:spawnEnemy(enemyType: string, position: Vector2Type): string
     end
 
     return entityId
+end
+
+function GameServer:spawnSnakeEnemy(position: Vector2Type): string
+    -- Get entity ID from network server (important for client-server sync!)
+    local entityId = self.networkServer:spawnEntity("enemy", position, {
+        type = "snake",
+        spriteSheet = Snake.CONFIG.spriteSheet,
+        frameSize = Snake.CONFIG.frameSize,
+        columns = Snake.CONFIG.columns,
+        animations = Snake.CONFIG.animations
+    })
+
+    self.entityManager:createEntity(entityId)
+
+    -- Get Snake components data
+    local components = Snake.createComponents(position)
+
+    -- Add all components to the entity
+    for componentType, componentData in pairs(components) do
+        self.entityManager:addComponent(entityId, componentType, componentData)
+    end
+
+    -- Initialize facing direction
+    local enemy = self.entityManager:getComponent(entityId, "Enemy")
+    if enemy then
+        enemy.facingDirection = "left"
+    end
+
+    -- Register hitbox with collision system
+    local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(entityId, "Hitbox") :: Hitbox?
+    if transform and hitbox then
+        self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
+    end
+
+    print("Spawned Snake enemy:", entityId, "at", position.x, position.y)
+    return entityId
+end
+
+function GameServer:createEnemyAttack(ownerId: string, attackData: any)
+    local attackId = ownerId .. "_attack_" .. tostring(tick())
+    local entity = self.entityManager:createEntity(attackId)
+
+    -- Add transform component
+    self.entityManager:addComponent(attackId, "Transform", {
+        position = attackData.position,
+        rotation = 0,
+        scale = Vector2.one(),
+        zIndex = 10,
+    })
+
+    -- Add attack hitbox component
+    self.entityManager:addComponent(attackId, "AttackHitbox", {
+        owner = ownerId,
+        damage = attackData.damage,
+        knockback = attackData.knockback,
+        lifetime = attackData.lifetime,
+    })
+
+    -- Add physics (for knockback visualization if needed)
+    self.entityManager:addComponent(attackId, "Physics", {
+        velocity = Vector2.zero(),
+        acceleration = Vector2.zero(),
+        mass = 0,
+        friction = 0,
+        restitution = 0,
+        isStatic = true,
+    })
+
+    -- Add collision hitbox
+    self.entityManager:addComponent(attackId, "Hitbox", {
+        size = attackData.size,
+        offset = Vector2.zero(),
+        isTrigger = true,
+        layer = 4, -- Enemy attack layer
+        mask = bit32.lshift(1, 1), -- Only collides with players
+        debugDraw = false,
+    })
+
+    -- Register hitbox
+    local transform = self.entityManager:getComponent(attackId, "Transform") :: Transform?
+    local hitbox = self.entityManager:getComponent(attackId, "Hitbox") :: Hitbox?
+    if transform and hitbox then
+        self.hitboxSystem:registerHitbox(attackId, hitbox, transform)
+    end
+
+    -- Schedule cleanup after lifetime expires
+    task.delay(attackData.lifetime, function()
+        if self.hitboxSystem then
+            self.hitboxSystem:unregisterHitbox(attackId)
+        end
+        if self.entityManager then
+            self.entityManager:destroyEntity(attackId)
+        end
+    end)
+
+    return attackId
 end
 
 function GameServer:handlePlayerAttack(player: Player, data: any?)
@@ -1112,6 +1305,9 @@ function GameServer:update(_deltaTime: number)
             -- Get the authoritative position from NetworkServer (sent by client)
             local playerData = self.networkServer.players[player]
             if playerData and playerData.position then
+                -- Store position before trusting client for debugging
+                local posBeforeTrust = character.position
+
                 -- Trust client's position (client already did collision detection at 60fps)
                 character.position = Vector2.new(playerData.position.x, playerData.position.y)
 
@@ -1119,9 +1315,22 @@ function GameServer:update(_deltaTime: number)
                     character.velocity = Vector2.new(playerData.velocity.x, playerData.velocity.y)
                 end
 
+                -- Debug: Check if position changed unexpectedly
+                if not self.lastServerPosDebug or (tick() - self.lastServerPosDebug) > 2 then
+                    self.lastServerPosDebug = tick()
+                    local posDiff = Vector2.distance(posBeforeTrust, character.position)
+                    if posDiff > 0.1 then -- Only log if there was actual movement
+                        print("[SERVER UPDATE]", player.Name,
+                              "Before:", math.floor(posBeforeTrust.x), math.floor(posBeforeTrust.y),
+                              "Client sent:", math.floor(character.position.x), math.floor(character.position.y),
+                              "Moved:", math.floor(posDiff))
+                    end
+                end
+
                 -- Sync to transform
                 local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
                 if transform then
+                    local transformBeforeSync = transform.position
                     transform.position = character.position
 
                     -- Update hitbox for server-side purposes (AI, etc.)
@@ -1134,6 +1343,18 @@ function GameServer:update(_deltaTime: number)
                         velocity = character.velocity,
                         state = character.state,
                     })
+
+                    -- Debug: Verify transform wasn't modified by other systems
+                    if not self.lastServerTransformDebug or (tick() - self.lastServerTransformDebug) > 2 then
+                        self.lastServerTransformDebug = tick()
+                        local transformDrift = Vector2.distance(transformBeforeSync, transform.position)
+                        if transformDrift > 0.1 then
+                            print("[SERVER TRANSFORM]", player.Name,
+                                  "Transform Before:", math.floor(transformBeforeSync.x), math.floor(transformBeforeSync.y),
+                                  "Transform After:", math.floor(transform.position.x), math.floor(transform.position.y),
+                                  "Drift:", math.floor(transformDrift))
+                        end
+                    end
                 end
             end
         end
@@ -1162,7 +1383,46 @@ function GameServer:update(_deltaTime: number)
     ]]
 
     -- Update ECS with actual deltaTime
+    -- Store player positions before ECS update to detect unwanted modifications
+    local playerPositionsBeforeECS = {}
+    for player, character in pairs(self.playerCharacters) do
+        local entityId = self.playerEntities[player]
+        if entityId then
+            local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+            if transform then
+                playerPositionsBeforeECS[player] = {
+                    x = transform.position.x,
+                    y = transform.position.y,
+                }
+            end
+        end
+    end
+
     self.entityManager:update(actualDeltaTime)
+
+    -- Debug: Check if any ECS system modified player positions (they shouldn't!)
+    if not self.lastECSDebug or (tick() - self.lastECSDebug) > 2 then
+        self.lastECSDebug = tick()
+        for player, character in pairs(self.playerCharacters) do
+            local entityId = self.playerEntities[player]
+            if entityId then
+                local transform = self.entityManager:getComponent(entityId, "Transform") :: Transform?
+                if transform and playerPositionsBeforeECS[player] then
+                    local beforePos = playerPositionsBeforeECS[player]
+                    local afterPos = transform.position
+                    local drift = math.sqrt((afterPos.x - beforePos.x)^2 + (afterPos.y - beforePos.y)^2)
+
+                    if drift > 0.1 then
+                        warn("[SERVER ECS MODIFIED PLAYER POS!]", player.Name,
+                             "Before ECS:", math.floor(beforePos.x), math.floor(beforePos.y),
+                             "After ECS:", math.floor(afterPos.x), math.floor(afterPos.y),
+                             "Drift:", math.floor(drift),
+                             "- This indicates a system is modifying player position!")
+                    end
+                end
+            end
+        end
+    end
 end
 
 function GameServer:fixedUpdate(deltaTime: number)

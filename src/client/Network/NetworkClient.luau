@@ -85,6 +85,18 @@ end
 function NetworkClient:setupPacketHandlers()
     -- Entity spawn
     Packets.EntitySpawn.onClientEvent = function(data)
+        -- Decode JSON data if present
+        if data.data and type(data.data) == "string" then
+            local success, decoded = pcall(function()
+                return HttpService:JSONDecode(data.data)
+            end)
+            if success then
+                data.data = decoded
+            else
+                warn("Failed to decode entity data JSON:", data.data)
+            end
+        end
+
         if self.onEntitySpawn then
             self.onEntitySpawn(data.entityId, data)
         end
@@ -123,6 +135,7 @@ function NetworkClient:setupPacketHandlers()
                 velocity = data.velocity,
                 state = data.state,
                 health = data.health,
+                facingDirection = data.facingDirection,
             }
             state.lastUpdate = tick()
         end
@@ -136,12 +149,32 @@ function NetworkClient:setupPacketHandlers()
     Packets.BatchEntityUpdate.onClientEvent = function(data)
         self.lastServerSequence = data.sequence
 
+        -- Debug: Log batch updates occasionally
+        if not self.lastBatchDebug or (tick() - self.lastBatchDebug) > 2 then
+            self.lastBatchDebug = tick()
+            print("[CLIENT] Received batch with", #data.updates, "updates, sequence:", data.sequence)
+            for i, update in ipairs(data.updates) do
+                if i <= 3 then  -- Only log first 3
+                    print("  Update", i, "entity:", update.entityId:sub(1, 8), "pos:", math.floor(update.position.x), math.floor(update.position.y), "vel:", math.floor(update.velocity and update.velocity.x or 0), math.floor(update.velocity and update.velocity.y or 0))
+                end
+            end
+        end
+
         for _, update in ipairs(data.updates) do
             local state = self.entityStates[update.entityId]
             if state then
                 state.previous = state.current
                 state.current = update
                 state.lastUpdate = tick()
+            else
+                -- Entity state doesn't exist yet - create it on-demand
+                -- This can happen if batch updates arrive before spawn packets due to network ordering
+                print("[CLIENT] Creating entityState on-demand for", update.entityId:sub(1, 8))
+                self.entityStates[update.entityId] = {
+                    current = update,
+                    previous = nil,
+                    lastUpdate = tick(),
+                }
             end
 
             if self.onEntityUpdate then
@@ -248,9 +281,10 @@ function NetworkClient:sendPositionUpdate(position: Vector2, velocity: Vector2, 
 
     -- Send client-authoritative position update to server
     -- Client has already processed movement/collision at 60fps
+    -- IMPORTANT: Convert Vector2 to plain tables for network transmission
     Packets.PlayerInput.send({
-        position = position,
-        velocity = velocity,
+        position = {x = position.x, y = position.y},
+        velocity = {x = velocity.x, y = velocity.y},
         state = state or "idle",
         sequence = self.sequence,
         timestamp = tick(),

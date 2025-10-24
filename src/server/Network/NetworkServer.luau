@@ -44,7 +44,14 @@ function NetworkServer.new()
     self.onPlayerInput = nil :: ((player: Player, input: InputState, deltaTime: number) -> ())?
     self.onPlayerAction = nil :: ((player: Player, action: string, data: any) -> ())?
 
+    -- Reference to GameServer for accessing entity manager
+    self.gameServer = nil :: any?
+
     return self
+end
+
+function NetworkServer:setGameServer(gameServer: any)
+    self.gameServer = gameServer
 end
 
 function NetworkServer:start()
@@ -333,6 +340,8 @@ end
 function NetworkServer:sendWorldState(player: Player)
     local worldEntities = {}
 
+    -- Only send player entities in WorldState
+    -- Static entities (enemies, obstacles, walls) are sent via sendStaticEntitiesToPlayer
     for entityId, entity in pairs(self.entities) do
         local playerData = nil
 
@@ -343,14 +352,17 @@ function NetworkServer:sendWorldState(player: Player)
             end
         end
 
-        table.insert(worldEntities, {
-            entityId = entityId,
-            entityType = (if playerData then "player" else "entity"),
-            position = (if playerData then playerData.position else {x = 0, y = 0}),
-            velocity = (if playerData then playerData.velocity else {x = 0, y = 0}),
-            state = "idle",
-            playerId = (if playerData then playerData.playerId else nil),
-        })
+        -- Only include player entities
+        if playerData then
+            table.insert(worldEntities, {
+                entityId = entityId,
+                entityType = "player",
+                position = playerData.position,
+                velocity = playerData.velocity,
+                state = "idle",
+                playerId = playerData.playerId,
+            })
+        end
     end
 
     self.sequence = self.sequence + 1
@@ -413,14 +425,41 @@ function NetworkServer:startSendLoop()
                 end
 
                 if playerData then
+                    -- Player entity update
                     local updateData = {
                         entityId = entityId,
                         position = playerData.position,
                         velocity = playerData.velocity,
-                        state = "idle", 
+                        state = "idle",
                     }
                     table.insert(updates, updateData)
-                    entityOwners[entityId] = ownerPlayer 
+                    entityOwners[entityId] = ownerPlayer
+                end
+            end
+        end
+
+        -- Also broadcast enemy entity positions (server-authoritative)
+        local enemyEntities = self.gameServer.entityManager:queryComponents("Enemy")
+        for entityId, enemyComp in pairs(enemyEntities) do
+            local entity = self.gameServer.entityManager:getEntity(entityId)
+            if entity and entity.active then
+                local transform = entity.components.Transform
+                local physics = entity.components.Physics
+                local ai = entity.components.AI
+                if transform and physics then
+                    -- Send actual AI state for animation sync
+                    local aiState = "idle"
+                    if ai and ai.state then
+                        aiState = ai.state
+                    end
+
+                    table.insert(updates, {
+                        entityId = entityId,
+                        position = transform.position,
+                        velocity = physics.velocity,
+                        state = aiState,
+                        facingDirection = enemyComp.facingDirection,
+                    })
                 end
             end
         end

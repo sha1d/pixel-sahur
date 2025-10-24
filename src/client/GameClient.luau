@@ -105,12 +105,30 @@ end
 function GameClient:setupNetworkCallbacks()
     -- Entity spawned
     self.networkClient.onEntitySpawn = function(entityId: string, data: any)
-        print("Entity spawned:", entityId, "Type:", data.entityType or "player")
+        local entityType = data.entityType or "player"
+        print("[SPAWN] Entity:", entityId:sub(1, 8), "Type:", entityType, "at", math.floor(data.position.x), math.floor(data.position.y))
 
-        -- Check if entity already exists - if so, skip spawning
-        if self.entityManager:getEntity(entityId) then
-            warn("Entity already exists:", entityId, "- skipping spawn")
-            return
+        -- Extra debug for enemy spawns
+        if entityType == "enemy" and data.data then
+            local decoded = data.data
+            if type(decoded) == "string" then
+                decoded = game:GetService("HttpService"):JSONDecode(decoded)
+            end
+            print("  [SPAWN] Enemy type:", decoded and decoded.type or "unknown")
+        end
+
+        -- Check if entity already exists
+        local existingEntity = self.entityManager:getEntity(entityId)
+        if existingEntity then
+            -- Check if it has Transform component (if not, it's incomplete)
+            if existingEntity.components.Transform then
+                warn("Entity already exists:", entityId, "- skipping spawn")
+                return
+            else
+                -- Entity exists but incomplete - destroy and recreate
+                print("Entity", entityId, "exists but incomplete - recreating")
+                self.entityManager:destroyEntity(entityId)
+            end
         end
 
         -- Create entity in ECS
@@ -126,11 +144,11 @@ function GameClient:setupNetworkCallbacks()
             position = position,
             rotation = 0,
             scale = Vector2.one(),
-            zIndex = (if isObstacle then 5 else 10),
+            zIndex = (if isObstacle then 5 elseif entityType == "enemy" then 8 else 20),  -- Players: 20, Enemies: 8, Obstacles: 5
         })
 
         -- Determine visual properties based on entity type
-        local imageId = "rbxassetid://128490447315329"
+        local imageId = "rbxassetid://128490447315329"  -- Default player sprite
         local size = Vector2.new(64, 64)
         local color = Color3.new(1, 1, 1)
 
@@ -142,6 +160,15 @@ function GameClient:setupNetworkCallbacks()
             imageId = "" -- No sprite, solid color
             size = data.size or Vector2.new(100, 20)
             color = Color3.new(0.3, 0.3, 0.4) -- Dark gray/blue
+        elseif entityType == "enemy" then
+            -- Use sprite sheet from data.data if provided (data is JSON-decoded on client)
+            local enemyData = data.data or {}
+            if enemyData.spriteSheet then
+                imageId = enemyData.spriteSheet
+            end
+            if enemyData.frameSize then
+                size = Vector2.new(enemyData.frameSize.x, enemyData.frameSize.y)
+            end
         end
 
         -- Add sprite component
@@ -155,18 +182,25 @@ function GameClient:setupNetworkCallbacks()
             flipY = false,
         })
 
+        -- Get transform to apply zIndex to renderer
+        local entityTransform = self.entityManager:getComponent(entityId, "Transform")
+
         -- Create renderer for entity
         if isObstacle then
             -- Create colored rectangle for obstacles
             local renderer = self.worldRenderer:createEntityRenderer(entityId, "", size)
-            if renderer then
+            if renderer and entityTransform then
                 renderer.BackgroundColor3 = color
                 renderer.BackgroundTransparency = 0
+                renderer.ZIndex = entityTransform.zIndex  -- Apply zIndex from transform
                 print("Created obstacle renderer:", entityId, "at", position.x, position.y, "size", size.x, size.y, "color", color)
             end
         else
             -- Create sprite renderer for players/entities
-            self.worldRenderer:createEntityRenderer(entityId, imageId, size)
+            local renderer = self.worldRenderer:createEntityRenderer(entityId, imageId, size)
+            if renderer and entityTransform then
+                renderer.ZIndex = entityTransform.zIndex  -- Apply zIndex from transform
+            end
         end
 
         -- Add hitbox for obstacles and walls
@@ -181,15 +215,15 @@ function GameClient:setupNetworkCallbacks()
             })
 
             -- Register hitbox with HitboxSystem
-            local transform = self.entityManager:getComponent(entityId, "Transform")
+            local obstacleTransform = self.entityManager:getComponent(entityId, "Transform")
             local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
-            if transform and hitbox then
-                self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
+            if obstacleTransform and hitbox then
+                self.hitboxSystem:registerHitbox(entityId, hitbox, obstacleTransform)
             end
 
             -- Immediately set position for obstacles (they don't move)
-            if self.worldRenderer then
-                self.worldRenderer:updateEntityPosition(entityId, transform.position)
+            if self.worldRenderer and obstacleTransform then
+                self.worldRenderer:updateEntityPosition(entityId, obstacleTransform.position)
             end
         end
 
@@ -219,6 +253,75 @@ function GameClient:setupNetworkCallbacks()
             if animController then
                 animController:play("idle")
             end
+        end
+
+        -- Setup sprite sheet animation for enemy entities
+        local enemyData = data.data or {}
+        print("DEBUG: Entity type:", entityType)
+        print("DEBUG: data.data exists:", data.data ~= nil)
+        if entityType == "enemy" then
+            local keys = {}
+            for k, _ in pairs(enemyData) do
+                table.insert(keys, tostring(k))
+            end
+            print("DEBUG: Enemy entity detected! enemyData keys:", table.concat(keys, ", "))
+            print("DEBUG: enemyData.type =", enemyData.type)
+            print("DEBUG: enemyData.spriteSheet =", enemyData.spriteSheet)
+            print("DEBUG: enemyData.animations =", enemyData.animations)
+        end
+
+        if entityType == "enemy" and enemyData.animations and enemyData.spriteSheet then
+            print("Setting up enemy animations for:", entityId)
+            print("  Sprite sheet:", enemyData.spriteSheet)
+            print("  Frame size:", enemyData.frameSize)
+            print("  Columns:", enemyData.columns)
+
+            -- Convert animation data from server format to client format
+            local clientAnimations = {}
+            for animName, animData in pairs(enemyData.animations) do
+                if animData.frames and #animData.frames > 0 then
+                    clientAnimations[animName] = {
+                        startFrame = animData.frames[1],
+                        endFrame = animData.frames[#animData.frames],
+                        frameRate = animData.frameRate or 8,
+                        loop = animData.loop ~= false,  -- Default to true if not specified
+                        columns = enemyData.columns or 8,  -- Pass columns to each animation
+                    }
+                    print("  Animation:", animName, "frames:", animData.frames[1], "-", animData.frames[#animData.frames])
+                end
+            end
+
+            self.worldRenderer:setupEntityAnimation(entityId, {
+                spriteSheet = enemyData.spriteSheet,
+                frameWidth = enemyData.frameSize and enemyData.frameSize.x or 64,
+                frameHeight = enemyData.frameSize and enemyData.frameSize.y or 64,
+                animations = clientAnimations
+            })
+
+            -- Start with idle animation
+            local animController = self.worldRenderer:getEntityAnimation(entityId)
+            if animController then
+                print("Playing idle animation for enemy:", entityId)
+                animController:play("idle")
+            else
+                warn("Failed to get animation controller for enemy:", entityId)
+            end
+
+            print("Setup enemy animations complete for:", entityId)
+        end
+
+        -- Add Enemy component for all enemy entities (needed for EnemySmoothingSystem)
+        if entityType == "enemy" then
+            self.entityManager:addComponent(entityId, "Enemy", {
+                type = enemyData.type or "unknown",
+                health = 100,
+                maxHealth = 100,
+                damage = 10,
+                moveSpeed = 80,
+                aggroRange = 250,
+                facingDirection = "left",
+            })
+            print("Added Enemy component to:", entityId, "type:", enemyData.type)
         end
 
         -- Skill animations configured with sprite sheet rbxassetid://111630265859486
@@ -269,9 +372,9 @@ function GameClient:setupNetworkCallbacks()
             })
 
             -- Initialize controller position from transform
-            local transform = self.entityManager:getComponent(entityId, "Transform")
-            if transform then
-                charController.position = transform.position
+            local charTransform = self.entityManager:getComponent(entityId, "Transform")
+            if charTransform then
+                charController.position = charTransform.position
             end
 
             -- Store character controller
@@ -279,8 +382,8 @@ function GameClient:setupNetworkCallbacks()
 
             -- Register player hitbox with HitboxSystem
             local hitbox = self.entityManager:getComponent(entityId, "Hitbox")
-            if transform and hitbox then
-                self.hitboxSystem:registerHitbox(entityId, hitbox, transform)
+            if charTransform and hitbox then
+                self.hitboxSystem:registerHitbox(entityId, hitbox, charTransform)
             end
 
             -- If this is the local player
@@ -334,6 +437,17 @@ function GameClient:setupNetworkCallbacks()
                 -- Local player is fully client-authoritative - ignore server position updates
                 -- Server only relays our position to other players, doesn't send corrections back
                 -- (This prevents jitter and teleporting from delayed server corrections)
+
+                -- Debug: Warn if we receive position updates for local player (shouldn't happen!)
+                if update.position then
+                    warn("[CLIENT] Received position update for LOCAL player! This shouldn't happen.",
+                         "Server pos:", math.floor(update.position.x), math.floor(update.position.y))
+
+                    local transform = self.entityManager:getComponent(entityId, "Transform")
+                    if transform then
+                        print("  Client pos:", math.floor(transform.position.x), math.floor(transform.position.y))
+                    end
+                end
             else
                 -- For remote players, let the interpolation system handle smooth movement
                 -- We'll update their position in the update loop using interpolation
@@ -535,11 +649,29 @@ function GameClient:registerSystems()
                     local blockedX = false
                     local blockedY = false
 
+                    -- Store position before update for debugging
+                    local posBeforeUpdate = charController.position
+
                     -- Update character controller with input and mouse position
                     charController:update(deltaTime, inputState, mouseWorldPos)
 
                     -- Sync transform with character controller for local player
+                    local posBeforeSync = transform.position
                     transform.position = charController.position
+
+                    -- Debug: Check for unexpected position changes
+                    if not self.lastClientPosDebug or (tick() - self.lastClientPosDebug) > 2 then
+                        self.lastClientPosDebug = tick()
+                        local posDiff = Vector2.distance(posBeforeUpdate, charController.position)
+                        local transformDrift = Vector2.distance(posBeforeSync, transform.position)
+                        print("[CLIENT CHARCONTROLLER]",
+                              "CharCtrl Before:", math.floor(posBeforeUpdate.x), math.floor(posBeforeUpdate.y),
+                              "CharCtrl After:", math.floor(charController.position.x), math.floor(charController.position.y),
+                              "Transform Before:", math.floor(posBeforeSync.x), math.floor(posBeforeSync.y),
+                              "Moved:", math.floor(posDiff),
+                              "TransformDrift:", math.floor(transformDrift),
+                              "Vel:", math.floor(charController.velocity.x), math.floor(charController.velocity.y))
+                    end
 
                     -- Update hitbox BEFORE collision check
                     local hitbox = entity.components.Hitbox
@@ -869,8 +1001,163 @@ function GameClient:registerSystems()
         end,
     }
 
+    -- Enemy Entity Smoothing system
+    local EnemySmoothingSystem = {
+        name = "EnemySmoothing",
+        priority = 0, -- Run early
+        requiredComponents = {"Transform", "Enemy"},
+        enabled = true,
+        update = function(system, entityManager, entities, deltaTime)
+            -- Debug: print every second
+            if not self.enemySmoothingDebugTime or (tick() - self.enemySmoothingDebugTime) > 1 then
+                self.enemySmoothingDebugTime = tick()
+                print("[EnemySmoothing] Found", #entities, "enemy entities")
+            end
+
+            for _, entity in ipairs(entities) do
+                local transform = entity.components.Transform
+
+                -- Get interpolated position from NetworkClient
+                local targetPos = self.networkClient:getInterpolatedPosition(entity.id)
+
+                -- Debug all enemies occasionally to check position sync
+                if not self.enemyPosDebugTime or (tick() - self.enemyPosDebugTime) > 2 then
+                    if entity == entities[1] then
+                        self.enemyPosDebugTime = tick()
+                        print("[EnemyPos] === Checking all enemy positions ===")
+
+                        -- Show player position for reference
+                        if self.localEntityId then
+                            local playerTransform = self.entityManager:getComponent(self.localEntityId, "Transform")
+                            if playerTransform then
+                                print("[EnemyPos] PLAYER at:", math.floor(playerTransform.position.x), math.floor(playerTransform.position.y))
+                            end
+                        end
+                    end
+
+                    local entityState = self.networkClient.entityStates[entity.id]
+                    if entityState then
+                        local current = entityState.current
+                        local serverPos = current.position
+                        local clientPos = transform.position
+                        local drift = math.sqrt((serverPos.x - clientPos.x)^2 + (serverPos.y - clientPos.y)^2)
+
+                        -- Calculate distance to player
+                        local distToPlayer = "?"
+                        if self.localEntityId then
+                            local playerTransform = self.entityManager:getComponent(self.localEntityId, "Transform")
+                            if playerTransform then
+                                local dx = clientPos.x - playerTransform.position.x
+                                local dy = clientPos.y - playerTransform.position.y
+                                distToPlayer = math.floor(math.sqrt(dx*dx + dy*dy))
+                            end
+                        end
+
+                        print("[EnemyPos]", entity.id:sub(1,8),
+                              "Client:", math.floor(clientPos.x), math.floor(clientPos.y),
+                              "Server:", math.floor(serverPos.x), math.floor(serverPos.y),
+                              "Drift:", math.floor(drift),
+                              "DistToPlayer:", distToPlayer,
+                              "State:", current.state or "nil")
+                    else
+                        print("[EnemyPos]", entity.id:sub(1,8), "has NO entityState!")
+                    end
+                end
+
+                if targetPos then
+                    -- Convert to Vector2
+                    local targetPosition = Vector2.new(targetPos.x, targetPos.y)
+
+                    -- Apply exponential smoothing
+                    local smoothingFactor = 12 -- Higher = snappier, Lower = smoother
+                    local t = 1 - math.exp(-smoothingFactor * deltaTime)
+
+                    -- Smooth position
+                    local currentPos = transform.position
+                    local smoothedPos = Vector2.lerp(currentPos, targetPosition, t)
+
+                    -- Update position
+                    transform.position = smoothedPos
+
+                    -- Update renderer position
+                    if self.worldRenderer then
+                        self.worldRenderer:updateEntityPosition(entity.id, smoothedPos)
+                    end
+                end
+            end
+        end,
+    }
+
+    -- Enemy Animation System (updates animations based on AI state and velocity)
+    local EnemyAnimationSystem = {
+        name = "EnemyAnimation",
+        priority = 5, -- After movement updates
+        requiredComponents = {"Transform", "Enemy"},
+        enabled = true,
+        update = function(system, entityManager, entities, deltaTime)
+            for _, entity in ipairs(entities) do
+                local enemy = entity.components.Enemy
+
+                -- Get animation controller
+                local animController = self.worldRenderer:getEntityAnimation(entity.id)
+                if animController then
+                    -- Get state and velocity from network updates
+                    local entityState = self.networkClient.entityStates[entity.id]
+                    if entityState and entityState.current then
+                        local state = entityState.current.state or "idle"
+                        local facingDir = entityState.current.facingDirection or enemy.facingDirection
+                        local velocity = entityState.current.velocity
+
+                        -- Update facing direction from server
+                        if facingDir then
+                            enemy.facingDirection = facingDir
+                        end
+
+                        -- Determine animation based on AI state first, then velocity
+                        local newAnimation = "idle"
+
+                        -- Use left animations as base and flip sprite when facing left
+                        -- (Sprite sheet default is right-facing, so we flip for left)
+                        local shouldFlip = false
+
+                        if state == "attack" then
+                            -- Show attack animation only during actual attack
+                            newAnimation = "attack_left"
+                            shouldFlip = enemy.facingDirection == "left"
+                        elseif state == "cooldown" then
+                            -- Show idle during cooldown so player can see the pause between attacks
+                            newAnimation = "idle"
+                            shouldFlip = enemy.facingDirection == "left"
+                        elseif velocity then
+                            local speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+
+                            if speed > 10 then
+                                -- Moving - use left animation and flip if facing left
+                                newAnimation = "move_left"
+                                shouldFlip = enemy.facingDirection == "left"
+                            end
+                        end
+
+                        -- Apply sprite flip based on facing direction
+                        if self.worldRenderer then
+                            self.worldRenderer:setEntityFlip(entity.id, shouldFlip)
+                        end
+
+                        -- Play animation if changed
+                        local currentAnim = animController:getCurrentAnimation()
+                        if currentAnim ~= newAnimation then
+                            animController:play(newAnimation)
+                        end
+                    end
+                end
+            end
+        end,
+    }
+
     self.entityManager:registerSystem(RemotePlayerSmoothingSystem)
+    self.entityManager:registerSystem(EnemySmoothingSystem)
     self.entityManager:registerSystem(CharacterControllerSystem)
+    self.entityManager:registerSystem(EnemyAnimationSystem)
     self.entityManager:registerSystem(AnimationSystem)
     self.entityManager:registerSystem(StaticObjectRenderingSystem)
     self.entityManager:registerSystem(CameraSystem)
